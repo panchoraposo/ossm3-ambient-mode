@@ -1,0 +1,52 @@
+---
+- name: Create Namespace for Service Mesh
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ ossm_namespace }}"
+        labels:
+          openshift.io/cluster-monitoring: "true"
+          pod-security.kubernetes.io/enforce: "privileged"
+          pod-security.kubernetes.io/audit: "privileged"
+          pod-security.kubernetes.io/warn: "privileged"
+
+- name: Create the Argo CD Application for the Operator
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "ossm3-operator"
+        namespace: "{{ argocd_namespace }}"
+        finalizers:
+          - resources-finalizer.argocd.argoproj.io
+      spec:
+        project: "default"
+        destination:
+          namespace: "{{ ossm_namespace }}"
+          server: "https://kubernetes.default.svc"
+        source:
+          repoURL: "{{ gitops_repo }}"
+          path: "apps/ossm3-operator/overlays/dev"
+          targetRevision: "main"
+          kustomize: {}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=false
+
+- name: Wait for the Operator to be ready (CSV Succeeded)
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ ossm_namespace }}"
+  register: csv_status
+  until: "csv_status.resources | json_query('[?contains(metadata.name, `servicemeshoperator`)].status.phase') | unique == ['Succeeded']"
+  retries: 30
+  delay: 10

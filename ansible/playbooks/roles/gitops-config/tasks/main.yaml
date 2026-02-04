@@ -1,0 +1,2 @@
+- name: Install OpenShift GitOps operator
+  include_tasks: install-operator.yaml
