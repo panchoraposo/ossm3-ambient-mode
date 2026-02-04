@@ -1,6 +1,8 @@
 # --- Service Mesh --- #
 ossm_namespace: "openshift-service-mesh"
 ossm_channel: "stable-3.2"
+kiali_namespace: "kiali-operator"
+control_plane_namespace: "istio-system"
 
 # --- GitOps --- #
 output_file: /tmp/gitops-subscription.yaml

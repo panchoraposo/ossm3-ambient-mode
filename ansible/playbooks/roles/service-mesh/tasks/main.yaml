@@ -1,2 +1,5 @@
-- name: Install OpenShift Service Mesh operator
-  include_tasks: install-operator.yaml
+- name: Install OpenShift Service Mesh 3 operator
+  include_tasks: ossm3-operator.yaml
+
+- name: Install Kiali operator
+  include_tasks: kiali-operator.yaml
