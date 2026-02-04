@@ -7,7 +7,8 @@ spec:
   managementState: Managed
   replicationFactor: 1
   retention:
-    global: 48h
+    global: 
+      traces: "48h"
   template:
     queryFrontend:
       jaegerQuery:
