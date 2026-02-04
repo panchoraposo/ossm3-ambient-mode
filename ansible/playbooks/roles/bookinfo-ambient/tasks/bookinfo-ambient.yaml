@@ -48,18 +48,47 @@
   retries: 60
   delay: 5
 
-- name: Get Istio Ingress Gateway Route
+- name: Get Gateway Service Name
+  kubernetes.core.k8s_info:
+    kind: Service
+    namespace: "bookinfo"
+    label_selectors:
+      - istio.io/gateway-name=bookinfo-gateway
+  register: gateway_svc
+  retries: 20
+  delay: 5
+  until: "gateway_svc.resources | length > 0"
+
+- name: Create OpenShift Route for Gateway
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        name: bookinfo-gateway
+        namespace: "bookinfo"
+      spec:
+        to:
+          kind: Service
+          name: "{{ gateway_svc.resources[0].metadata.name }}"
+          weight: 100
+        port:
+          targetPort: http
+        wildcardPolicy: None
+  when: gateway_svc.resources | length > 0
+
+- name: Get Route Host
   kubernetes.core.k8s_info:
     kind: Route
-    namespace: "istio-system"
-    label_selectors:
-      - istio=ingressgateway
-  register: route_info
+    name: bookinfo-gateway
+    namespace: "bookinfo"
+  register: new_route
 
 - name: Display Access URL
   debug:
     msg: 
-      - "Bookinfo Deployed in Ambient Mode!"
-      - "Access the application here:"
-      - "http://{{ route_info.resources[0].spec.host }}/productpage"
-  when: route_info.resources | length > 0
+      - "¡Bookinfo Desplegado con K8s Gateway API!"
+      - "Accede a la aplicación aquí:"
+      - "http://{{ new_route.resources[0].spec.host }}/productpage"
+  when: new_route.resources | length > 0
