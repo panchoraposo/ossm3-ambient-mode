@@ -1,0 +1,70 @@
+---
+- name: Enable User Workload Monitoring (Required for Kiali/Thanos)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: cluster-monitoring-config
+        namespace: openshift-monitoring
+      data:
+        config.yaml: |
+          enableUserWorkload: true
+
+- name: Create & Label ztunnel Namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "ztunnel"
+        labels:
+          openshift.io/cluster-monitoring: "true"
+          pod-security.kubernetes.io/enforce: "privileged"
+          istio.io/dataplane-mode: ambient 
+
+- name: Create ArgoCD Application for Ambient Mesh
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "istio-ambient-mode"
+        namespace: "{{ argocd_namespace }}"
+      spec:
+        project: "default"
+        destination:
+          namespace: "istio-system"
+          server: "https://kubernetes.default.svc"
+        source:
+          repoURL: "{{ gitops_repo }}"
+          path: "apps/istio/overlays/dev"
+          targetRevision: "main"
+          kustomize: {}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - ServerSideApply=true
+            - CreateNamespace=true
+        ignoreDifferences:
+        - group: kiali.io
+          kind: Kiali
+          jsonPointers:
+          - /spec/deployment/image_digest
+          - /status
+
+- name: Wait for Istio Control Plane to be Healthy
+  kubernetes.core.k8s_info:
+    api_version: sailoperator.io/v1
+    kind: Istio
+    name: default
+    namespace: "istio-system"
+  register: istio_status
+  until: "istio_status.resources | length > 0 and istio_status.resources[0].status.state == 'Healthy'"
+  retries: 60
+  delay: 10

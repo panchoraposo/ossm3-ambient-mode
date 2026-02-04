@@ -39,16 +39,12 @@
           syncOptions:
             - CreateNamespace=false
 
-- name: Create istio-system namespace (Required for the instance)
-  kubernetes.core.k8s:
-    state: present
-    definition:
-      apiVersion: v1
-      kind: Namespace
-      metadata:
-        name: "{{ control_plane_namespace }}"
-        labels:
-          openshift.io/cluster-monitoring: "true"
-          pod-security.kubernetes.io/enforce: "privileged"
-          pod-security.kubernetes.io/audit: "privileged"
-          pod-security.kubernetes.io/warn: "privileged"
+- name: Wait for Kiali Operator to be ready
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ kiali_namespace }}"
+  register: kiali_csv
+  until: "kiali_csv.resources | json_query('[?contains(metadata.name, `kiali-operator`)].status.phase') | unique == ['Succeeded']"
+  retries: 60
+  delay: 10

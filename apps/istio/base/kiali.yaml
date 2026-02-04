@@ -1,0 +1,34 @@
+apiVersion: kiali.io/v1alpha1
+kind: Kiali
+metadata:
+  name: kiali
+  namespace: istio-system
+spec:
+  version: "default"
+  auth:
+    strategy: openshift
+  deployment:
+    accessible_namespaces: ["**"]
+    cluster_wide_access: true
+    instance_name: kiali
+    view_only_mode: false
+  external_services:
+    prometheus:
+      url: "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+      is_core: true
+      auth:
+        type: bearer
+        use_kiali_token: true
+        insecure_skip_verify: true
+      cache_enabled: true
+      cache_duration: 7
+      cache_expiration: 300
+    tracing:
+      enabled: true
+      provider: tempo
+      in_cluster_url: "http://tempo-tempo-query-frontend.istio-system.svc.cluster.local:3200"
+      url: "http://tempo-tempo-query-frontend.istio-system.svc.cluster.local:3200"
+      use_grpc: false
+      grpc_port: 9095
+    grafana:
+      enabled: false

@@ -1,0 +1,4 @@
+resources:
+  - istio.yaml
+  - kiali.yaml
+  - pod-monitor.yaml

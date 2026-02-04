@@ -1,0 +1,26 @@
+apiVersion: tempo.grafana.com/v1alpha1
+kind: TempoStack
+metadata:
+  name: tempo
+  namespace: istio-system
+spec:
+  managementState: Managed
+  replicationFactor: 1
+  retention:
+    global: 48h
+  template:
+    queryFrontend:
+      jaegerQuery:
+        enabled: true
+        ingress:
+          type: route
+  storage:
+    secret:
+      name: tempo-demo-s3
+      type: s3
+  storageSize: 10Gi
+  resources:
+    total:
+      limits:
+        memory: 2Gi
+        cpu: 2000m

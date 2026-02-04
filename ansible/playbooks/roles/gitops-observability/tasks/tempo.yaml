@@ -50,6 +50,18 @@
   no_log: true
   vars: { ansible_conditional_need_retry: true }
 
+- name: Create & Label istio-system Namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "istio-system"
+        labels:
+          openshift.io/cluster-monitoring: "true" 
+          pod-security.kubernetes.io/enforce: "privileged"
+
 - name: Get ODF (NooBaa) default StorageClass
   kubernetes.core.k8s_info:
     kind: StorageClass
@@ -67,29 +79,29 @@
       kind: ObjectBucketClaim
       metadata:
         name: "tempo-bucket-claim"
-        namespace: "{{ observability_namespace }}"
+        namespace: "istio-system"
       spec:
-        generateBucketName: "tempostack"
+        generateBucketName: "tempostack-data"
         storageClassName: "{{ odf_sc.resources[0].metadata.name }}"
 
 - name: Wait for ODF-generated Secret
   kubernetes.core.k8s_info:
     kind: Secret
     name: "tempo-bucket-claim"
-    namespace: "{{ observability_namespace }}"
+    namespace: "istio-system"
   register: odf_secret
   until: "odf_secret.resources | length > 0"
-  retries: 20
+  retries: 30
   delay: 10
 
-- name: Wait for ODF-generated ConfigMap (for bucket name/endpoint)
+- name: Wait for ODF-generated ConfigMap
   kubernetes.core.k8s_info:
     kind: ConfigMap
     name: "tempo-bucket-claim"
-    namespace: "{{ observability_namespace }}"
+    namespace: "istio-system"
   register: odf_cm
   until: "odf_cm.resources | length > 0"
-  retries: 20
+  retries: 30
   delay: 10
 
 - name: Create the 'TempoStack' S3 Secret from ODF values
@@ -100,10 +112,38 @@
       kind: Secret
       metadata:
         name: "tempo-demo-s3"
-        namespace: "{{ observability_namespace }}"
+        namespace: "istio-system"
       stringData:
         access_key_id: "{{ odf_secret.resources[0].data.AWS_ACCESS_KEY_ID | b64decode }}"
         access_key_secret: "{{ odf_secret.resources[0].data.AWS_SECRET_ACCESS_KEY | b64decode }}"
         bucket: "{{ odf_cm.resources[0].data.BUCKET_NAME }}"
         endpoint: "https://{{ odf_cm.resources[0].data.BUCKET_HOST }}"
+      type: Opaque
 
+- name: Create the Argo CD Application for the Instance
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "tempostack"
+        namespace: "{{ argocd_namespace }}"
+        finalizers:
+          - resources-finalizer.argocd.argoproj.io
+      spec:
+        project: "default"
+        destination:
+          namespace: "istio-system"
+          server: "https://kubernetes.default.svc"
+        source:
+          repoURL: "{{ gitops_repo }}"
+          path: "apps/tempo/overlays/dev"
+          targetRevision: "main"
+          kustomize: {}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=false
