@@ -3,3 +3,6 @@
 
 - name: Install Kiali operator
   include_tasks: kiali-operator.yaml
+
+- name: Deploy Service Mesh Ambient mode
+  include_tasks: ambient-mode.yaml

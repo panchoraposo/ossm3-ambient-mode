@@ -58,13 +58,36 @@
           - /spec/deployment/image_digest
           - /status
 
-- name: Wait for Istio Control Plane to be Healthy
+- name: Wait for Istio Control Plane to be Ready
   kubernetes.core.k8s_info:
     api_version: sailoperator.io/v1
     kind: Istio
     name: default
     namespace: "istio-system"
   register: istio_status
-  until: "istio_status.resources | length > 0 and istio_status.resources[0].status.state == 'Healthy'"
+  until: >-
+    istio_status.resources | length > 0
+    and
+    (istio_status.resources[0].status.conditions | default([])
+     | selectattr('type', 'equalto', 'Ready')
+     | selectattr('status', 'equalto', 'True')
+     | list | length > 0)
   retries: 60
   delay: 10
+
+- name: Create OSSMConsole (Enable OpenShift Console Plugin)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: kiali.io/v1alpha1
+      kind: OSSMConsole
+      metadata:
+        name: ossmconsole
+        namespace: "istio-system" 
+      spec:
+        version: "default"
+        deployment:
+          imagePullPolicy: IfNotPresent
+        kiali:
+          serviceName: ''
+          serviceNamespace: ''

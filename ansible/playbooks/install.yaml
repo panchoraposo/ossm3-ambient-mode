@@ -5,6 +5,7 @@
   
   roles:
     - role: gitops-config
-    - role: service-mesh
     - role: gitops-deploy-odf
     - role: gitops-observability
+    - role: service-mesh
+    
