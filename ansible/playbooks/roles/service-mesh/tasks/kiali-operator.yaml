@@ -11,6 +11,34 @@
           openshift.io/cluster-monitoring: "true"
           pod-security.kubernetes.io/enforce: "privileged"
 
+- name: Create the Argo CD Application for the Operator
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "kiali-operator"
+        namespace: "{{ argocd_namespace }}"
+        finalizers:
+          - resources-finalizer.argocd.argoproj.io
+      spec:
+        project: "default"
+        destination:
+          namespace: "{{ kiali_namespace }}"
+          server: "https://kubernetes.default.svc"
+        source:
+          repoURL: "{{ gitops_repo }}"
+          path: "apps/kiali-operator/overlays/dev"
+          targetRevision: "main"
+          kustomize: {}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=false
+
 - name: Create istio-system namespace (Required for the instance)
   kubernetes.core.k8s:
     state: present
