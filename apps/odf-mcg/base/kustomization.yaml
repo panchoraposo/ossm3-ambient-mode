@@ -1,0 +1,4 @@
+resources:
+  - nooba.yaml
+  #- storage-system.yaml
+  - storage-cluster.yaml
