@@ -1,0 +1,65 @@
+---
+- name: Create 'bookinfo' Namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "bookinfo"
+        labels:
+          openshift.io/cluster-monitoring: "true"
+          istio.io/dataplane-mode: ambient 
+
+- name: Create ArgoCD Application for Bookinfo
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "bookinfo-app"
+        namespace: "{{ argocd_namespace }}"
+      spec:
+        project: "default"
+        destination:
+          namespace: "bookinfo"
+          server: "https://kubernetes.default.svc"
+        source:
+          repoURL: "{{ gitops_repo }}"
+          path: "apps/bookinfo/base"
+          targetRevision: "main"
+          kustomize: {}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=false
+
+- name: Wait for ProductPage Pod to be Ready
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "bookinfo"
+    label_selectors:
+      - app=productpage
+  register: pod_status
+  until: "pod_status.resources | length > 0 and pod_status.resources[0].status.phase == 'Running'"
+  retries: 60
+  delay: 5
+
+- name: Get Istio Ingress Gateway Route
+  kubernetes.core.k8s_info:
+    kind: Route
+    namespace: "istio-system"
+    label_selectors:
+      - istio=ingressgateway
+  register: route_info
+
+- name: Display Access URL
+  debug:
+    msg: 
+      - "Bookinfo Deployed in Ambient Mode!"
+      - "Access the application here:"
+      - "http://{{ route_info.resources[0].spec.host }}/productpage"
+  when: route_info.resources | length > 0
