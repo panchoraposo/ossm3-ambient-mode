@@ -88,7 +88,7 @@
 - name: Display Access URL
   debug:
     msg: 
-      - "¡Bookinfo Desplegado con K8s Gateway API!"
-      - "Accede a la aplicación aquí:"
+      - "Bookinfo Deployed with K8s Gateway API!"
+      - "Access the application here:"
       - "http://{{ new_route.resources[0].spec.host }}/productpage"
   when: new_route.resources | length > 0
