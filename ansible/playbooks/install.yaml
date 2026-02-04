@@ -8,4 +8,4 @@
     - role: gitops-deploy-odf
     - role: gitops-observability
     - role: service-mesh
-    
+    - role: bookinfo-ambient
