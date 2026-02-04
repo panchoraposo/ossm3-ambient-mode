@@ -1,0 +1,110 @@
+---
+- name: "Crear aplicación ArgoCD para instalar el ODF Operator"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: odf-operator
+        namespace: openshift-gitops
+      spec:
+        project: default
+        source: { repoURL: "{{ gitops_repo }}", targetRevision: main, path: apps/odf-operator/overlays/dev }
+        destination: { server: https://kubernetes.default.svc }
+        syncPolicy: { automated: { prune: true, selfHeal: true }, syncOptions: [ "CreateNamespace=true" ] }
+
+- name: "Esperar a que el ODF Operator se instale correctamente (CSV Succeeded)"
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: openshift-storage
+    label_selectors:
+      - "operators.coreos.com/odf-operator.openshift-storage"
+  register: odf_csv_info
+  until: >
+    odf_csv_info.resources is defined and
+    odf_csv_info.resources | length > 0 and
+    odf_csv_info.resources[0].status.phase == 'Succeeded'
+  retries: 60
+  delay: 10
+  changed_when: false
+
+- name: "Obtener todos los nodos del clúster"
+  kubernetes.core.k8s_info:
+    kind: Node
+  register: all_nodes
+
+- name: "Determinar los nodos de destino para ODF (SNO o Multi-Nodo)"
+  ansible.builtin.set_fact:
+    odf_target_nodes: "{{ all_nodes.resources if (all_nodes.resources | length) == 1 else (all_nodes.resources | selectattr('metadata.labels.\"node-role.kubernetes.io/worker\"', 'defined')) | list }}"
+
+- name: "Etiquetar los nodos de destino para ODF"
+  ansible.builtin.command: >
+    oc label node {{ item.metadata.name }} cluster.ocs.openshift.io/openshift-storage='' --overwrite
+  loop: "{{ odf_target_nodes }}"
+  loop_control:
+    loop_var: item
+  register: label_result
+  changed_when: "'labeled' in label_result.stdout"
+
+- name: "Crear aplicación ArgoCD para la instancia de ODF MCG (StorageSystem)"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: odf-mcg-instance
+        namespace: openshift-gitops
+      spec:
+        project: default
+        source: { repoURL: "{{ gitops_repo }}", targetRevision: main, path: apps/odf-mcg/overlays/dev }
+        destination: { server: https://kubernetes.default.svc }
+        syncPolicy: { automated: { prune: true, selfHeal: true } }
+        ignoreDifferences:
+        - group: ocs.openshift.io
+          kind: StorageCluster
+          name: ocs-storagecluster
+          namespace: openshift-storage
+          jsonPointers:
+          - /metadata/ownerReferences
+
+- name: Esperar a que el CSV de ODF se instale correctamente
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: openshift-storage
+  register: csv_list
+  until:
+    - csv_list.resources | length > 0
+    - csv_list.resources[0].status.phase is defined
+    - csv_list.resources[0].status.phase == "Succeeded"
+  retries: 30
+  delay: 20
+
+- name: Verificar que la CRD StorageCluster ya existe
+  kubernetes.core.k8s_info:
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: storageclusters.ocs.openshift.io
+  register: crd_check
+  until: crd_check.resources | length > 0
+  retries: 20
+  delay: 15
+
+- name: "Esperar a que la instancia de NooBaa esté lista (Phase: Ready)"
+  kubernetes.core.k8s_info:
+    api_version: noobaa.io/v1alpha1
+    kind: NooBaa
+    name: noobaa
+    namespace: openshift-storage
+  register: noobaa_instance_info
+  until: >
+    noobaa_instance_info.resources | length > 0 and
+    noobaa_instance_info.resources[0].status is defined and
+    noobaa_instance_info.resources[0].status.phase is defined and
+    noobaa_instance_info.resources[0].status.phase == 'Ready'
+  retries: 90
+  delay: 10
+  changed_when: false

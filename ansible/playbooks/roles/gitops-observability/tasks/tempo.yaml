@@ -1,0 +1,109 @@
+---
+- name: Create namespace for the Tempo Operator
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ tempo_namespace }}"
+
+- name: Create the Argo CD Application for the Operator
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "tempo-operator"
+        namespace: "{{ argocd_namespace }}"
+        finalizers:
+          - resources-finalizer.argocd.argoproj.io
+      spec:
+        project: "default"
+        destination:
+          namespace: "{{ tempo_namespace }}"
+          server: "https://kubernetes.default.svc"
+        source:
+          repoURL: "{{ gitops_repo }}"
+          path: "apps/tempo-operator/overlays/dev"
+          targetRevision: "main"
+          kustomize: {}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=false
+
+- name: Wait for the Tempo Operator to be ready
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ tempo_namespace }}"
+    label_selectors:
+      - "operators.coreos.com/tempo-product.{{ tempo_namespace }}="
+  register: csv_status
+  until: "csv_status.resources | length > 0 and csv_status.resources[0].status.phase == 'Succeeded'"
+  retries: 40
+  delay: 15
+  no_log: true
+  vars: { ansible_conditional_need_retry: true }
+
+- name: Get ODF (NooBaa) default StorageClass
+  kubernetes.core.k8s_info:
+    kind: StorageClass
+    name: openshift-storage.noobaa.io
+  register: odf_sc
+  until: "odf_sc.resources | length > 0"
+  retries: 10
+  delay: 5
+
+- name: Create ObjectBucketClaim (OBC) for Tempo
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: objectbucket.io/v1alpha1
+      kind: ObjectBucketClaim
+      metadata:
+        name: "tempo-bucket-claim"
+        namespace: "{{ observability_namespace }}"
+      spec:
+        generateBucketName: "tempostack"
+        storageClassName: "{{ odf_sc.resources[0].metadata.name }}"
+
+- name: Wait for ODF-generated Secret
+  kubernetes.core.k8s_info:
+    kind: Secret
+    name: "tempo-bucket-claim"
+    namespace: "{{ observability_namespace }}"
+  register: odf_secret
+  until: "odf_secret.resources | length > 0"
+  retries: 20
+  delay: 10
+
+- name: Wait for ODF-generated ConfigMap (for bucket name/endpoint)
+  kubernetes.core.k8s_info:
+    kind: ConfigMap
+    name: "tempo-bucket-claim"
+    namespace: "{{ observability_namespace }}"
+  register: odf_cm
+  until: "odf_cm.resources | length > 0"
+  retries: 20
+  delay: 10
+
+- name: Create the 'TempoStack' S3 Secret from ODF values
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "tempo-demo-s3"
+        namespace: "{{ observability_namespace }}"
+      stringData:
+        access_key_id: "{{ odf_secret.resources[0].data.AWS_ACCESS_KEY_ID | b64decode }}"
+        access_key_secret: "{{ odf_secret.resources[0].data.AWS_SECRET_ACCESS_KEY | b64decode }}"
+        bucket: "{{ odf_cm.resources[0].data.BUCKET_NAME }}"
+        endpoint: "https://{{ odf_cm.resources[0].data.BUCKET_HOST }}"
+

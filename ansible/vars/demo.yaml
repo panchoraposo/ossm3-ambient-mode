@@ -7,3 +7,7 @@ output_file: /tmp/gitops-subscription.yaml
 gitops_channel: latest
 argocd_namespace: openshift-gitops
 gitops_repo: "https://github.com/panchoraposo/ossm3-ambient-mode"
+
+# --- Observability --- #
+observability_namespace: observability
+tempo_namespace: openshift-tempo-operator

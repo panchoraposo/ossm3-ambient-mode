@@ -1,0 +1,6 @@
+---
+- name: Deploy Red Hat Build of OpenTelemetry
+  include_tasks: otel.yaml
+
+- name: Deploy Tempo
+  include_tasks: tempo.yaml

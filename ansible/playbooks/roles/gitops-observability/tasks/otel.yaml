@@ -1,0 +1,56 @@
+---
+- name: Create namespace for the OpenTelemetry Operator
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ observability_namespace }}"
+
+- name: Create the Argo CD Application for the Operator
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: Application
+      metadata:
+        name: "otel-operator"
+        namespace: "{{ argocd_namespace }}"
+        finalizers:
+          - resources-finalizer.argocd.argoproj.io
+      spec:
+        project: "default"
+        destination:
+          namespace: "{{ observability_namespace }}"
+          server: "https://kubernetes.default.svc"
+        source:
+          repoURL: "{{ gitops_repo }}"
+          path: "apps/otel-operator/overlays/dev"
+          targetRevision: "main"
+          kustomize: {}
+        syncPolicy:
+          automated:
+            prune: true
+            selfHeal: true
+          syncOptions:
+            - CreateNamespace=false
+
+- name: Wait for the OpenTelemetry Operator to be ready
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ observability_namespace }}"
+    label_selectors:
+      - "operators.coreos.com/opentelemetry-product.{{ observability_namespace }}=" 
+  register: csv_status
+  until: >
+    csv_status.resources | length > 0 and
+    csv_status.resources[0].status.phase is defined and
+    csv_status.resources[0].status.phase == "Succeeded"
+  retries: 40
+  delay: 15
+  no_log: true
+  vars:
+    ansible_conditional_need_retry: true
+
