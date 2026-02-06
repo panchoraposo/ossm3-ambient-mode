@@ -2,7 +2,7 @@ apiVersion: tempo.grafana.com/v1alpha1
 kind: TempoStack
 metadata:
   name: tempo
-  namespace: observability
+  namespace: istio-system
 spec:
   managementState: Managed
   replicationFactor: 1
