@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: otel-collector-manual
-  namespace: istio-system
+  namespace: observability
   labels:
     app: otel-collector
 data:
@@ -28,7 +28,7 @@ data:
         timeout: 200ms
     exporters:
       otlp/tempo:
-        endpoint: "tempo-tempo-distributor.istio-system.svc.cluster.local:4317"
+        endpoint: "tempo-tempo-distributor.observability.svc.cluster.local:4317"
         tls:
           insecure: true
       debug:
@@ -44,7 +44,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: otel-collector
-  namespace: istio-system
+  namespace: observability
   labels:
     app: otel-collector
 spec:
@@ -77,7 +77,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: otel-collector
-  namespace: istio-system
+  namespace: observability
 spec:
   selector:
     app: otel-collector
