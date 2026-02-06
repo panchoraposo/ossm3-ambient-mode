@@ -1,46 +1,113 @@
 ---
-- name: Create 'bookinfo' Namespace
+- name: Label 'ztunnel' namespace for Istio Discovery
+  kubernetes.core.k8s:
+    state: patched
+    kind: Namespace
+    name: "{{ ztunnel_ns }}"
+    definition:
+      metadata:
+        labels:
+          istio-discovery: enabled
+
+- name: Label 'istio-system' namespace for Istio Discovery
+  kubernetes.core.k8s:
+    state: patched
+    kind: Namespace
+    name: "{{ istio_ns }}"
+    definition:
+      metadata:
+        labels:
+          istio-discovery: enabled
+
+- name: Restart Istiod (Reload namespace cache)
+  kubernetes.core.k8s:
+    state: absent
+    kind: Pod
+    namespace: "{{ istio_ns }}"
+    label_selectors:
+      - app=istiod
+
+- name: Wait for Istiod to be Ready
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ istio_ns }}"
+    label_selectors:
+      - app=istiod
+  register: istiod_pod
+  until: >-
+    istiod_pod.resources | length > 0
+    and
+    istiod_pod.resources[0].status.phase == 'Running'
+  retries: 60
+  delay: 5
+
+- name: Restart Ztunnel (Reconnect to Istiod with new permissions)
+  kubernetes.core.k8s:
+    state: absent
+    kind: Pod
+    namespace: "{{ ztunnel_ns }}"
+    label_selectors:
+      - app=ztunnel
+
+- name: Wait for Ztunnel to be Ready
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ ztunnel_ns }}"
+    label_selectors:
+      - app=ztunnel
+  register: ztunnel_pod
+  until: >-
+    ztunnel_pod.resources | length > 0
+    and
+    (ztunnel_pod.resources | selectattr('status.phase', 'equalto', 'Running') | list | length) > 0
+  retries: 60
+  delay: 5
+
+# ==============================================================================
+# 3. PREPARACIÓN DEL NAMESPACE BOOKINFO
+# ==============================================================================
+- name: Create 'bookinfo' Namespace with Ambient Labels
   kubernetes.core.k8s:
     state: present
     definition:
       apiVersion: v1
       kind: Namespace
       metadata:
-        name: "bookinfo"
+        name: "{{ app_ns }}"
         labels:
-          openshift.io/cluster-monitoring: "true"
-          istio.io/dataplane-mode: ambient 
+          istio-discovery: enabled
+          istio.io/dataplane-mode: ambient
 
-- name: Create ArgoCD Application for Bookinfo
+# ==============================================================================
+# 4. DESPLIEGUE DE APLICACIÓN
+# ==============================================================================
+- name: Deploy Bookinfo Base
   kubernetes.core.k8s:
     state: present
-    definition:
-      apiVersion: argoproj.io/v1alpha1
-      kind: Application
-      metadata:
-        name: "bookinfo-app"
-        namespace: "{{ argocd_namespace }}"
-      spec:
-        project: "default"
-        destination:
-          namespace: "bookinfo"
-          server: "https://kubernetes.default.svc"
-        source:
-          repoURL: "{{ gitops_repo }}"
-          path: "apps/bookinfo/base"
-          targetRevision: "main"
-          kustomize: {}
-        syncPolicy:
-          automated:
-            prune: true
-            selfHeal: true
-          syncOptions:
-            - CreateNamespace=false
+    namespace: "{{ app_ns }}"
+    src: "{{ bookinfo_yaml }}"
 
-- name: Wait for ProductPage Pod to be Ready
+- name: Deploy Bookinfo Versions
+  kubernetes.core.k8s:
+    state: present
+    namespace: "{{ app_ns }}"
+    src: "{{ bookinfo_versions_yaml }}"
+
+# ==============================================================================
+# 5. ENROLLMENT (REINICIO DE PODS)
+# ==============================================================================
+- name: Ensure Pods pick up Ambient Mesh (Force Restart)
+  kubernetes.core.k8s:
+    state: absent
+    kind: Pod
+    namespace: "{{ app_ns }}"
+    label_selectors:
+      - "app in (productpage, details, ratings, reviews)"
+
+- name: Wait for Bookinfo Pods to be Running
   kubernetes.core.k8s_info:
     kind: Pod
-    namespace: "bookinfo"
+    namespace: "{{ app_ns }}"
     label_selectors:
       - app=productpage
   register: pod_status
@@ -48,18 +115,71 @@
   retries: 60
   delay: 5
 
-- name: Get Gateway Service Name
-  kubernetes.core.k8s_info:
-    kind: Service
-    namespace: "bookinfo"
-    label_selectors:
-      - istio.io/gateway-name=bookinfo-gateway
-  register: gateway_svc
-  retries: 20
-  delay: 5
-  until: "gateway_svc.resources | length > 0"
+# ==============================================================================
+# 6. Gateway + Route
+# ==============================================================================
+- name: Create Gateway
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: bookinfo-gateway
+        namespace: "{{ app_ns }}"
+        annotations:
+          networking.istio.io/service-type: ClusterIP
+      spec:
+        gatewayClassName: istio
+        listeners:
+        - name: http
+          port: 80
+          protocol: HTTP
+          allowedRoutes:
+            namespaces:
+              from: Same
 
-- name: Create OpenShift Route for Gateway
+- name: Create HTTPRoute
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: HTTPRoute
+      metadata:
+        name: bookinfo
+        namespace: "{{ app_ns }}"
+      spec:
+        parentRefs:
+        - name: bookinfo-gateway
+        rules:
+        - matches:
+          - path:
+              type: PathPrefix
+              value: /productpage
+          - path:
+              type: PathPrefix
+              value: /static
+          - path:
+              type: PathPrefix
+              value: /login
+          - path:
+              type: PathPrefix
+              value: /logout
+          - path:
+              type: PathPrefix
+              value: /api/v1/products
+          backendRefs:
+          - name: productpage
+            port: 9080
+
+- name: Get OpenShift Ingress Domain
+  kubernetes.core.k8s_info:
+    api_version: config.openshift.io/v1
+    kind: Ingress
+    name: cluster
+  register: ingress_config
+
+- name: Create OpenShift Route
   kubernetes.core.k8s:
     state: present
     definition:
@@ -67,28 +187,30 @@
       kind: Route
       metadata:
         name: bookinfo-gateway
-        namespace: "bookinfo"
+        namespace: "{{ app_ns }}"
       spec:
+        host: "bookinfo.{{ ingress_config.resources[0].spec.domain }}"
         to:
           kind: Service
-          name: "{{ gateway_svc.resources[0].metadata.name }}"
+          name: "bookinfo-gateway-istio"
           weight: 100
         port:
-          targetPort: http
+          targetPort: 80
         wildcardPolicy: None
-  when: gateway_svc.resources | length > 0
 
 - name: Get Route Host
   kubernetes.core.k8s_info:
+    api_version: route.openshift.io/v1
     kind: Route
     name: bookinfo-gateway
-    namespace: "bookinfo"
-  register: new_route
+    namespace: bookinfo
+  register: route_info
 
-- name: Display Access URL
-  debug:
-    msg: 
-      - "Bookinfo Deployed with K8s Gateway API!"
-      - "Access the application here:"
-      - "http://{{ new_route.resources[0].spec.host }}/productpage"
-  when: new_route.resources | length > 0
+- name: Generate Traffic to create Traces
+  uri:
+    url: "http://{{ route_info.resources[0].spec.host }}/productpage"
+    method: GET
+    status_code: 200
+  loop: "{{ range(0, 30) | list }}"
+  delay: 1
+  ignore_errors: yes

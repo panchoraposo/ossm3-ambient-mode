@@ -1,5 +1,8 @@
 ---
-- name: Enable User Workload Monitoring (Required for Kiali/Thanos)
+# ==============================================================================
+# 0. PREPARATION: MONITORING
+# ==============================================================================
+- name: Enable User Workload Monitoring
   kubernetes.core.k8s:
     state: present
     definition:
@@ -12,87 +15,219 @@
         config.yaml: |
           enableUserWorkload: true
 
-- name: Create & Label ztunnel Namespace
+# ==============================================================================
+# 1. NAMESPACES
+# ==============================================================================
+- name: Configure Namespaces
   kubernetes.core.k8s:
     state: present
     definition:
       apiVersion: v1
       kind: Namespace
       metadata:
-        name: "ztunnel"
-        labels:
-          openshift.io/cluster-monitoring: "true"
-          pod-security.kubernetes.io/enforce: "privileged"
-          istio.io/dataplane-mode: ambient 
+        name: "{{ item.name }}"
+        labels: "{{ item.labels }}"
+  loop:
+    - name: "{{ ztunnel_ns }}"
+      labels:
+        pod-security.kubernetes.io/enforce: privileged
+        istio.io/dataplane-mode: ambient
+        istio-discovery: enabled
+    - name: "istio-cni"
+      labels:
+        openshift.io/cluster-monitoring: "true"
+        pod-security.kubernetes.io/enforce: privileged
 
-- name: Create ArgoCD Application for Ambient Mesh
+- name: Ensure 'istio-system' has Discovery Label
+  kubernetes.core.k8s:
+    state: patched
+    kind: Namespace
+    name: "{{ istio_ns }}"
+    definition:
+      metadata:
+        labels:
+          istio-discovery: enabled
+          openshift.io/cluster-monitoring: "true"
+
+# ==============================================================================
+# 2. ISTIO COMPONENTS (CNI, ZTUNNEL, CONTROL PLANE)
+# ==============================================================================
+- name: Deploy IstioCNI
   kubernetes.core.k8s:
     state: present
     definition:
-      apiVersion: argoproj.io/v1alpha1
-      kind: Application
+      apiVersion: sailoperator.io/v1
+      kind: IstioCNI
       metadata:
-        name: "istio-ambient-mode"
-        namespace: "{{ argocd_namespace }}"
+        name: default
       spec:
-        project: "default"
-        destination:
-          namespace: "istio-system"
-          server: "https://kubernetes.default.svc"
-        source:
-          repoURL: "{{ gitops_repo }}"
-          path: "apps/istio/overlays/dev"
-          targetRevision: "main"
-          kustomize: {}
-        syncPolicy:
-          automated:
-            prune: true
-            selfHeal: true
-          syncOptions:
-            - ServerSideApply=true
-            - CreateNamespace=true
-        ignoreDifferences:
-        - group: kiali.io
-          kind: Kiali
-          jsonPointers:
-          - /spec/deployment/image_digest
-          - /status
+        namespace: "istio-cni"
+        profile: ambient
+        values:
+          cni:
+            ambient:
+              reconcileIptablesOnStartup: true
 
-- name: Wait for Istio Control Plane to be Ready
-  kubernetes.core.k8s_info:
-    api_version: sailoperator.io/v1
-    kind: Istio
-    name: default
-    namespace: "istio-system"
-  register: istio_status
-  until: >-
-    istio_status.resources | length > 0
-    and
-    (istio_status.resources[0].status.conditions | default([])
-     | selectattr('type', 'equalto', 'Ready')
-     | selectattr('status', 'equalto', 'True')
-     | list | length > 0)
-  retries: 60
-  delay: 10
+- name: Deploy Istio Control Plane (With Tracing Provider)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: sailoperator.io/v1
+      kind: Istio
+      metadata:
+        name: default
+        namespace: "{{ istio_ns }}"
+      spec:
+        profile: ambient
+        values:
+          pilot:
+            trustedZtunnelNamespace: "{{ ztunnel_ns }}"
+          meshConfig:
+            enableTracing: true
+            extensionProviders:
+            - name: "tempo-otlp"
+              opentelemetry:
+                service: "tempo-tempo-distributor.istio-system.svc.cluster.local"
+                port: 4317
+            defaultConfig:
+              tracing:
+                sampling: 100.0
 
-- name: Grant cluster-monitoring-view to Kiali SA
+- name: Deploy ZTunnel
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: sailoperator.io/v1
+      kind: ZTunnel
+      metadata:
+        name: default
+        namespace: "{{ istio_ns }}"
+      spec:
+        namespace: "{{ ztunnel_ns }}"
+        version: v1.27.3
+
+# ==============================================================================
+# 3. PERMISSIONS & CERTS (ZTUNNEL)
+# ==============================================================================
+- name: Sync CA Certs to Ztunnel
+  shell: |
+    # Getting the secret directly is more reliable in a single block for sync
+    CERT=$(oc get secret istio-ca-secret -n {{ istio_ns }} -o jsonpath='{.data.ca-cert\.pem}')
+    oc create configmap istio-ca-root-cert -n {{ ztunnel_ns }} --from-literal=root-cert.pem="$(echo $CERT | base64 -d)" --dry-run=client -o yaml | oc apply -f -
+
+- name: Create ClusterRoleBinding for Ztunnel Impersonation
   kubernetes.core.k8s:
     state: present
     definition:
       apiVersion: rbac.authorization.k8s.io/v1
       kind: ClusterRoleBinding
       metadata:
-        name: kiali-monitoring-view
+        name: ztunnel-impersonation
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: ztunnel-impersonation
       subjects:
       - kind: ServiceAccount
+        name: ztunnel
+        namespace: "{{ ztunnel_ns }}"
+      - kind: ServiceAccount
+        name: default
+        namespace: "{{ ztunnel_ns }}"
+
+# ==============================================================================
+# 4. OBSERVABILITY: METRICS (PODMONITOR)
+# ==============================================================================
+- name: Create PodMonitor for Ztunnel
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: PodMonitor
+      metadata:
+        name: ztunnel-monitor
+        namespace: "{{ ztunnel_ns }}"
+        labels:
+          k8s-app: ztunnel-monitor
+      spec:
+        selector:
+          matchLabels:
+            app: ztunnel
+        podMetricsEndpoints:
+        - path: /stats/prometheus
+          targetPort: 15020
+          interval: 30s
+
+# ==============================================================================
+# 5. OBSERVABILITY: KIALI & CONSOLE
+# ==============================================================================
+- name: Create Standalone Kiali Instance
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: kiali.io/v1alpha1
+      kind: Kiali
+      metadata:
         name: kiali
-        namespace: "istio-system"
+        namespace: "{{ istio_ns }}"
+      spec:
+        deployment:
+          accessible_namespaces:
+          - "**"
+          view_only_mode: false
+        external_services:
+          grafana:
+            enabled: false
+          prometheus:
+            auth:
+              type: bearer
+              use_kiali_token: true
+            url: "https://thanos-querier.openshift-monitoring.svc.cluster.local:9091"
+            thanos_proxy:
+              enabled: true
+          tracing:
+            enabled: true
+            provider: "tempo"
+            in_cluster_url: "http://tempo-tempo-query-frontend.istio-system.svc.cluster.local:3200"
+            use_grpc: false
+        auth:
+          strategy: openshift
+
+- name: Grant 'kiali' Role to Service Account
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: kiali-role-binding
+      subjects:
+      - kind: ServiceAccount
+        name: kiali-service-account
+        namespace: "{{ istio_ns }}"
+      roleRef:
+        kind: ClusterRole
+        name: kiali
+        apiGroup: rbac.authorization.k8s.io
+
+- name: Grant 'cluster-monitoring-view' (For Metrics)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: kiali-monitoring-access
+      subjects:
+      - kind: ServiceAccount
+        name: kiali-service-account
+        namespace: "{{ istio_ns }}"
       roleRef:
         kind: ClusterRole
         name: cluster-monitoring-view
         apiGroup: rbac.authorization.k8s.io
 
-- name: Create OSSMConsole (Enable OpenShift Console Plugin)
+- name: Create OSSMConsole Linked to Kiali
   kubernetes.core.k8s:
     state: present
     definition:
@@ -100,11 +235,57 @@
       kind: OSSMConsole
       metadata:
         name: ossmconsole
-        namespace: "istio-system" 
+        namespace: "{{ istio_ns }}"
       spec:
-        version: "default"
+        version: default
         deployment:
           imagePullPolicy: IfNotPresent
         kiali:
-          serviceName: ''
-          serviceNamespace: ''
+          serviceName: kiali
+          serviceNamespace: "{{ istio_ns }}"
+          external_services:
+            tracing:
+              enabled: true
+              provider: "tempo"
+              in_cluster_url: "http://tempo-tempo-query-frontend.istio-system.svc.cluster.local:3200"
+              use_grpc: false
+
+# ==============================================================================
+# 6. TELEMETRY (METRICS + TRACING)
+# ==============================================================================
+- name: Configure Mesh-wide Telemetry
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: telemetry.istio.io/v1
+      kind: Telemetry
+      metadata:
+        name: mesh-default
+        namespace: "{{ istio_ns }}"
+      spec:
+        metrics:
+        - providers:
+          - name: prometheus
+        tracing:
+        - providers:
+          - name: "tempo-otlp"
+          randomSamplingPercentage: 100
+
+# ==============================================================================
+# 7. REFRESH COMPONENTS
+# ==============================================================================
+- name: Restart Kiali Pod
+  kubernetes.core.k8s:
+    state: absent
+    kind: Pod
+    namespace: "{{ istio_ns }}"
+    label_selectors:
+      - app.kubernetes.io/name=kiali
+
+- name: Restart Ztunnel Pods
+  kubernetes.core.k8s:
+    state: absent
+    kind: Pod
+    namespace: "{{ ztunnel_ns }}"
+    label_selectors:
+      - app=ztunnel

@@ -36,20 +36,21 @@
           syncOptions:
             - CreateNamespace=false
 
-- name: Wait for the Tempo Operator to be ready
+- name: Wait for the Tempo Operator CSV to be Succeeded
   kubernetes.core.k8s_info:
     api_version: operators.coreos.com/v1alpha1
     kind: ClusterServiceVersion
     namespace: "{{ tempo_namespace }}"
-    label_selectors:
-      - "operators.coreos.com/tempo-product.{{ tempo_namespace }}="
   register: csv_status
-  until: "csv_status.resources | length > 0 and csv_status.resources[0].status.phase == 'Succeeded'"
-  retries: 40
-  delay: 15
-  no_log: true
-  vars: { ansible_conditional_need_retry: true }
-
+  until: >-
+    csv_status.resources 
+    | selectattr('metadata.name', 'search', 'tempo') 
+    | selectattr('status.phase', 'equalto', 'Succeeded') 
+    | list 
+    | length > 0
+  retries: 20
+  delay: 10
+  
 - name: Create & Label istio-system Namespace
   kubernetes.core.k8s:
     state: present

@@ -41,18 +41,15 @@
     api_version: operators.coreos.com/v1alpha1
     kind: ClusterServiceVersion
     namespace: "{{ observability_namespace }}"
-    label_selectors:
-      - "operators.coreos.com/opentelemetry-product.{{ observability_namespace }}=" 
   register: csv_status
-  until: >
-    csv_status.resources | length > 0 and
-    csv_status.resources[0].status.phase is defined and
-    csv_status.resources[0].status.phase == "Succeeded"
-  retries: 40
-  delay: 15
-  no_log: true
-  vars:
-    ansible_conditional_need_retry: true
+  until: >-
+    csv_status.resources 
+    | selectattr('metadata.name', 'search', 'opentelemetry') 
+    | selectattr('status.phase', 'equalto', 'Succeeded') 
+    | list 
+    | length > 0
+  retries: 20
+  delay: 10
 
 - name: Create the Argo CD Application for the Collector
   kubernetes.core.k8s:
