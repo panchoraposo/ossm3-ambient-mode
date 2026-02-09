@@ -9,3 +9,4 @@
     - role: gitops-observability
     - role: service-mesh
     - role: bookinfo-ambient
+    - role: connectivity-link

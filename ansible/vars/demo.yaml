@@ -11,4 +11,19 @@ gitops_repo: "https://github.com/panchoraposo/ossm3-ambient-mode"
 
 # --- Observability --- #
 observability_namespace: observability
-tempo_namespace: openshift-tempo-operator
+tempo_namespace: "openshift-tempo-operator"
+tempo_service: "tempo-tempo-distributor.istio-system.svc.cluster.local"
+tempo_port: 4317
+# Istio -> Tempo
+tempo_distributor_service: "tempo-tempo-distributor.istio-system.svc.cluster.local"
+tempo_distributor_port: 4317
+# Kiali -> Tempo
+tempo_query_service: "tempo-tempo-query-frontend.istio-system.svc.cluster.local"
+tempo_query_port: 3200
+
+# --- Bookinfo --- #
+app_ns: "bookinfo"
+istio_ns: "istio-system"
+ztunnel_ns: "ztunnel"
+bookinfo_yaml: "https://raw.githubusercontent.com/openshift-service-mesh/istio/release-1.27/samples/bookinfo/platform/kube/bookinfo.yaml"
+bookinfo_versions_yaml: "https://raw.githubusercontent.com/openshift-service-mesh/istio/release-1.27/samples/bookinfo/platform/kube/bookinfo-versions.yaml"

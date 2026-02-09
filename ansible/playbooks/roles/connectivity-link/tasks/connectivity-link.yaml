@@ -1,0 +1,119 @@
+---
+  - name: "Create 'kuadrant-system' namespace"
+    kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: kuadrant-system
+          labels:
+            openshift.io/cluster-monitoring: "true"
+  
+  - name: "Get real Root CA from Istio Secret"
+    kubernetes.core.k8s_info:
+      api_version: v1
+      kind: Secret
+      name: istio-ca-secret
+      namespace: istio-system
+    register: istio_secret_ca
+    until: istio_secret_ca.resources | length > 0
+    retries: 60
+    delay: 5
+  
+  - name: "Force creation of 'istio-ca-root-cert' in kuadrant-system"
+    kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: istio-ca-root-cert
+          namespace: kuadrant-system
+          labels:
+            istio.io/config: "true"
+        data:
+          root-cert.pem: "{{ istio_secret_ca.resources[0].data['ca-cert.pem'] | b64decode }}"
+    when: istio_secret_ca.resources | length > 0
+  
+  - name: "Create ArgoApp for Connectivity Link Operator"
+    kubernetes.core.k8s:
+      state: present
+      definition:
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: rhcl-operator
+          namespace: openshift-gitops
+        spec:
+          project: default
+          source: 
+            repoURL: "{{ gitops_repo }}"
+            targetRevision: main 
+            path: apps/connectivity-link-operator/overlays/dev 
+          destination: 
+            server: https://kubernetes.default.svc
+          syncPolicy: 
+            automated: 
+              prune: true
+              selfHeal: true
+            syncOptions: 
+              - CreateNamespace=true
+  
+  - name: "Approve pending InstallPlans"
+    ansible.builtin.shell: |
+      for ip in $(oc get installplan -n kuadrant-system -o jsonpath='{.items[?(@.status.phase=="RequiresApproval")].metadata.name}'); do
+        oc patch installplan $ip -n kuadrant-system --type merge --patch '{"spec":{"approved":true}}'
+        echo "Approved: $ip"
+      done
+    register: approve_cmd
+    changed_when: "'Approved' in approve_cmd.stdout"
+    retries: 5
+    delay: 10
+  
+  - name: "Wait for Operator Deployments to be created"
+    kubernetes.core.k8s_info:
+      api_version: apps/v1
+      kind: Deployment
+      namespace: kuadrant-system
+    register: operator_deployments
+    until: 
+      - operator_deployments.resources | length > 0
+      - operator_deployments.resources | json_query("[?contains(metadata.name, 'dns-operator')]") | length > 0
+      - operator_deployments.resources | json_query("[?contains(metadata.name, 'limitador-operator')]") | length > 0
+    retries: 60
+    delay: 5
+  
+  - name: "Restart all pods in kuadrant-system"
+    ansible.builtin.shell: |
+      oc delete pods --all -n kuadrant-system --ignore-not-found
+    ignore_errors: yes
+  
+  - name: "Wait for Operators to be Healthy (Available)"
+    kubernetes.core.k8s_info:
+      api_version: apps/v1
+      kind: Deployment
+      name: "{{ item }}"
+      namespace: kuadrant-system
+    register: op_ready
+    until:
+      - op_ready.resources is defined
+      - op_ready.resources | length > 0
+      - op_ready.resources[0].status.readyReplicas is defined
+      - op_ready.resources[0].status.readyReplicas >= 1
+    retries: 60
+    delay: 10
+    loop:
+      - dns-operator-controller-manager
+      - limitador-operator-controller-manager
+      - kuadrant-operator-controller-manager
+  
+  - name: "Patch to enable 'kuadrant-console-plugin'"
+    kubernetes.core.k8s:
+      api_version: operator.openshift.io/v1
+      kind: Console
+      name: cluster
+      state: patched
+      definition:
+        spec:
+          plugins: ["kuadrant-console-plugin"]
