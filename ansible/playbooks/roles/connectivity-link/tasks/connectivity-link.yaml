@@ -108,7 +108,7 @@
       - limitador-operator-controller-manager
       - kuadrant-operator-controller-manager
   
-  - name: "Patch to enable 'kuadrant-console-plugin'"
+  - name: "Enable both 'ossmconsole' and 'kuadrant-console-plugin'"
     kubernetes.core.k8s:
       api_version: operator.openshift.io/v1
       kind: Console
@@ -116,4 +116,6 @@
       state: patched
       definition:
         spec:
-          plugins: ["kuadrant-console-plugin"]
+          plugins: 
+            - "ossmconsole"
+            - "kuadrant-console-plugin"
