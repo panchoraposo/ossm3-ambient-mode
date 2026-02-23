@@ -20,6 +20,14 @@
     - role: gitops-config
     - role: connectivity-link
 
+- name: Phase 4.5 - Install GitOps on hub cluster (acm)
+  hosts: acm
+  gather_facts: false
+  vars_files:
+    - ../vars/demo.yaml
+  roles:
+    - role: gitops-config
+
 - name: Phase 5 - Deploy Bookinfo application
   import_playbook: roles/multi-cluster/tasks/apps.yaml
 

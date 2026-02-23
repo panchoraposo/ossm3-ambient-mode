@@ -19,6 +19,7 @@ It also installs a **central observability hub** on an ACM cluster (`acm`) so yo
   - Connectivity Link components in `kuadrant-system` and a `Kuadrant` CR applied from [`kuadrant.yaml`](https://raw.githubusercontent.com/maximilianoPizarro/nfl-wallet-gitops/main/kuadrant.yaml)
 
 - **Hub cluster (`acm`)**
+  - OpenShift GitOps (operator + `ArgoCD/openshift-gitops`, with controller resources patched)
   - TempoStack (Tempo) for centralized tracing
   - OTEL collector ingress (OTLP/HTTP) for trace ingestion from data clusters
   - promxy as a single Prometheus-compatible API for Kiali (fan-out to both clusters)
@@ -87,9 +88,10 @@ High-level phases:
 3. Exchange remote secrets (peering)
 4. Configure multi-network (east-west gateway + `meshNetworks`)
 5. Install GitOps + Connectivity Link + Kuadrant on `east` and `west`
-6. Deploy Bookinfo + per-service waypoints
-7. Install centralized tracing on `acm` and configure exporters on `east`/`west`
-8. Install centralized observability on `acm` (promxy + Kiali multi-cluster)
+6. Install GitOps on `acm`
+7. Deploy Bookinfo + per-service waypoints
+8. Install centralized tracing on `acm` and configure exporters on `east`/`west`
+9. Install centralized observability on `acm` (promxy + Kiali multi-cluster)
 
 ## Generate traffic
 
