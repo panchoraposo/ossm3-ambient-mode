@@ -1,6 +1,7 @@
 ---
   - name: "Create 'kuadrant-system' namespace"
     kubernetes.core.k8s:
+      context: "{{ k8s_context | default(omit) }}"
       state: present
       definition:
         apiVersion: v1
@@ -12,6 +13,7 @@
   
   - name: "Get real Root CA from Istio Secret"
     kubernetes.core.k8s_info:
+      context: "{{ k8s_context | default(omit) }}"
       api_version: v1
       kind: Secret
       name: istio-ca-secret
@@ -23,6 +25,7 @@
   
   - name: "Force creation of 'istio-ca-root-cert' in kuadrant-system"
     kubernetes.core.k8s:
+      context: "{{ k8s_context | default(omit) }}"
       state: present
       definition:
         apiVersion: v1
@@ -38,6 +41,7 @@
   
   - name: "Create ArgoApp for Connectivity Link Operator"
     kubernetes.core.k8s:
+      context: "{{ k8s_context | default(omit) }}"
       state: present
       definition:
         apiVersion: argoproj.io/v1alpha1
@@ -62,8 +66,8 @@
   
   - name: "Approve pending InstallPlans"
     ansible.builtin.shell: |
-      for ip in $(oc get installplan -n kuadrant-system -o jsonpath='{.items[?(@.status.phase=="RequiresApproval")].metadata.name}'); do
-        oc patch installplan $ip -n kuadrant-system --type merge --patch '{"spec":{"approved":true}}'
+      for ip in $(oc{{ (' --context ' ~ k8s_context) if (k8s_context is defined) else '' }} get installplan -n kuadrant-system -o jsonpath='{.items[?(@.status.phase=="RequiresApproval")].metadata.name}'); do
+        oc{{ (' --context ' ~ k8s_context) if (k8s_context is defined) else '' }} patch installplan $ip -n kuadrant-system --type merge --patch '{"spec":{"approved":true}}'
         echo "Approved: $ip"
       done
     register: approve_cmd
@@ -73,6 +77,7 @@
   
   - name: "Wait for Operator Deployments to be created"
     kubernetes.core.k8s_info:
+      context: "{{ k8s_context | default(omit) }}"
       api_version: apps/v1
       kind: Deployment
       namespace: kuadrant-system
@@ -86,11 +91,12 @@
   
   - name: "Restart all pods in kuadrant-system"
     ansible.builtin.shell: |
-      oc delete pods --all -n kuadrant-system --ignore-not-found
+      oc{{ (' --context ' ~ k8s_context) if (k8s_context is defined) else '' }} delete pods --all -n kuadrant-system --ignore-not-found
     ignore_errors: yes
   
   - name: "Wait for Operators to be Healthy (Available)"
     kubernetes.core.k8s_info:
+      context: "{{ k8s_context | default(omit) }}"
       api_version: apps/v1
       kind: Deployment
       name: "{{ item }}"
@@ -110,6 +116,7 @@
   
   - name: "Enable both 'ossmconsole' and 'kuadrant-console-plugin'"
     kubernetes.core.k8s:
+      context: "{{ k8s_context | default(omit) }}"
       api_version: operator.openshift.io/v1
       kind: Console
       name: cluster
@@ -119,3 +126,11 @@
           plugins: 
             - "ossmconsole"
             - "kuadrant-console-plugin"
+
+  - name: "Apply Kuadrant CR (Authorino + Limitador) in kuadrant-system"
+    vars:
+      kuadrant_yaml_url: "{{ kuadrant_yaml_url | default('https://raw.githubusercontent.com/maximilianoPizarro/nfl-wallet-gitops/main/kuadrant.yaml') }}"
+    ansible.builtin.shell: |
+      set -e
+      oc{{ (' --context ' ~ k8s_context) if (k8s_context is defined) else '' }} apply -n kuadrant-system -f {{ kuadrant_yaml_url }}
+    changed_when: true

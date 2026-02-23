@@ -1,0 +1,254 @@
+---
+- name: Ensure istio-system namespace exists
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ istio_ns }}"
+
+- name: Create remote Kiali ServiceAccount (view-only)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ kiali_remote_sa }}"
+        namespace: "{{ istio_ns }}"
+
+- name: Bind cluster-reader to remote Kiali ServiceAccount
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "kiali-remote-cluster-reader-{{ inventory_hostname }}"
+      subjects:
+      - kind: ServiceAccount
+        name: "{{ kiali_remote_sa }}"
+        namespace: "{{ istio_ns }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-reader
+
+- name: Allow remote Kiali to port-forward to istiod (istio-system)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: kiali-remote-portforward
+        namespace: "{{ istio_ns }}"
+      rules:
+        - apiGroups: [""]
+          resources: ["pods/portforward"]
+          verbs: ["create"]
+
+- name: Bind port-forward Role to remote Kiali SA (istio-system)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: kiali-remote-portforward
+        namespace: "{{ istio_ns }}"
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ kiali_remote_sa }}"
+          namespace: "{{ istio_ns }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: kiali-remote-portforward
+
+- name: Allow remote Kiali to port-forward to ztunnel (ztunnel namespace)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: kiali-remote-portforward
+        namespace: "{{ ztunnel_ns }}"
+      rules:
+        - apiGroups: [""]
+          resources: ["pods/portforward"]
+          verbs: ["create"]
+
+- name: Bind port-forward Role to remote Kiali SA (ztunnel namespace)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: kiali-remote-portforward
+        namespace: "{{ ztunnel_ns }}"
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ kiali_remote_sa }}"
+          namespace: "{{ istio_ns }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: kiali-remote-portforward
+
+- name: Allow remote Kiali to read Gateway API resources (optional, reduces log noise)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: kiali-remote-gatewayapi-reader
+      rules:
+        - apiGroups: ["gateway.networking.k8s.io"]
+          resources: ["referencegrants", "gatewayclasses"]
+          verbs: ["get", "list", "watch"]
+
+- name: Bind Gateway API ClusterRole to remote Kiali SA
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "kiali-remote-gatewayapi-reader-{{ inventory_hostname }}"
+      subjects:
+        - kind: ServiceAccount
+          name: "{{ kiali_remote_sa }}"
+          namespace: "{{ istio_ns }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: kiali-remote-gatewayapi-reader
+
+- name: Create Metrics reader ServiceAccount (for promxy -> thanos-querier route)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: "{{ metrics_reader_sa }}"
+        namespace: "{{ istio_ns }}"
+
+- name: Bind cluster-monitoring-view to Metrics reader ServiceAccount
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: "acm-thanos-reader-monitoring-{{ inventory_hostname }}"
+      subjects:
+      - kind: ServiceAccount
+        name: "{{ metrics_reader_sa }}"
+        namespace: "{{ istio_ns }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-monitoring-view
+
+- name: Ensure legacy SA token secrets exist (long-lived)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      type: kubernetes.io/service-account-token
+      metadata:
+        name: "{{ item.secret_name }}"
+        namespace: "{{ istio_ns }}"
+        annotations:
+          kubernetes.io/service-account.name: "{{ item.sa_name }}"
+  loop:
+    - { sa_name: "{{ kiali_remote_sa }}", secret_name: "{{ kiali_remote_sa }}-token" }
+    - { sa_name: "{{ metrics_reader_sa }}", secret_name: "{{ metrics_reader_sa }}-token" }
+
+- name: Wait for SA token secrets to be populated
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ istio_ns }}"
+    name: "{{ item }}"
+  register: token_secrets
+  until: token_secrets.resources | length > 0 and (token_secrets.resources[0].data.token is defined)
+  retries: 30
+  delay: 5
+  changed_when: false
+  loop:
+    - "{{ kiali_remote_sa }}-token"
+    - "{{ metrics_reader_sa }}-token"
+
+- name: Read remote Kiali token (from Secret)
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ istio_ns }}"
+    name: "{{ kiali_remote_sa }}-token"
+  register: kiali_remote_token_secret
+  changed_when: false
+
+- name: Read metrics reader token (from Secret)
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: v1
+    kind: Secret
+    namespace: "{{ istio_ns }}"
+    name: "{{ metrics_reader_sa }}-token"
+  register: metrics_reader_token_secret
+  changed_when: false
+
+- name: Capture API server for kubeconfig
+  shell: |
+    set -e
+    oc --context {{ k8s_context }} whoami --show-server
+  register: cluster_server
+  changed_when: false
+
+- name: Capture cluster CA data for kubeconfig
+  shell: |
+    set -e
+    # Prefer kube-root-ca.crt (always present in OpenShift namespaces)
+    python3 - <<'PY'
+    import base64, subprocess
+    ctx = "{{ k8s_context }}"
+    ns = "{{ istio_ns }}"
+    pem = subprocess.check_output(
+      ["oc","--context",ctx,"-n",ns,"get","cm","kube-root-ca.crt","-o","jsonpath={.data.ca\\.crt}"]
+    ).decode("utf-8")
+    if not pem.strip():
+        raise SystemExit("Empty kube-root-ca.crt")
+    print(base64.b64encode(pem.encode("utf-8")).decode("utf-8"))
+    PY
+  register: cluster_ca_data
+  changed_when: false
+
+- name: Set per-cluster facts (tokens + api endpoint + ca)
+  set_fact:
+    kiali_remote_token_value: "{{ (kiali_remote_token_secret.resources[0].data.token | b64decode) }}"
+    metrics_reader_token_value: "{{ (metrics_reader_token_secret.resources[0].data.token | b64decode) }}"
+    remote_api_server: "{{ cluster_server.stdout }}"
+    remote_ca_data: "{{ cluster_ca_data.stdout }}"
+

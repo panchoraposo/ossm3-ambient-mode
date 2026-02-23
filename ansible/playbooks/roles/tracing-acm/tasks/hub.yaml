@@ -1,0 +1,193 @@
+---
+- name: Ensure Tempo Operator namespace exists
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ tempo_operator_ns }}"
+
+- name: Ensure Tempo Operator OperatorGroup exists
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: tempo-operator-group
+        namespace: "{{ tempo_operator_ns }}"
+      spec: {}
+
+- name: Ensure Tempo Operator Subscription exists
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: tempo-operator
+        namespace: "{{ tempo_operator_ns }}"
+      spec:
+        channel: stable
+        installPlanApproval: Automatic
+        name: "tempo-product"
+        source: "redhat-operators"
+        sourceNamespace: "openshift-marketplace"
+
+- name: Wait for Tempo Operator CSV to be Succeeded
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ tempo_operator_ns }}"
+  register: tempo_csv
+  until: >-
+    tempo_csv.resources
+    | selectattr('metadata.name', 'search', 'tempo')
+    | selectattr('status.phase', 'equalto', 'Succeeded')
+    | list
+    | length > 0
+  retries: 60
+  delay: 10
+
+- name: Ensure istio-system namespace exists (and is privileged for Tempo/collector)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ istio_ns }}"
+        labels:
+          openshift.io/cluster-monitoring: "true"
+          pod-security.kubernetes.io/enforce: "privileged"
+
+- name: Detect ODF StorageClass for Tempo S3 backend
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: "{{ odf_storageclass_name }}"
+  register: odf_sc
+
+- name: Fail if ODF is not available (TempoStack expects S3 secret)
+  when: odf_sc.resources | length == 0
+  fail:
+    msg: >-
+      ODF StorageClass '{{ odf_storageclass_name }}' was not found on ACM.
+      This demo provisions Tempo storage via NooBaa (ODF) and requires ODF installed.
+
+- name: Create ObjectBucketClaim (OBC) for Tempo
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: objectbucket.io/v1alpha1
+      kind: ObjectBucketClaim
+      metadata:
+        name: "{{ tempo_obc_name }}"
+        namespace: "{{ istio_ns }}"
+      spec:
+        generateBucketName: "tempostack-data"
+        storageClassName: "{{ odf_sc.resources[0].metadata.name }}"
+
+- name: Wait for ODF-generated Secret for Tempo bucket
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    kind: Secret
+    name: "{{ tempo_obc_name }}"
+    namespace: "{{ istio_ns }}"
+  register: odf_secret
+  until: odf_secret.resources | length > 0
+  retries: 60
+  delay: 10
+
+- name: Wait for ODF-generated ConfigMap for Tempo bucket
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    kind: ConfigMap
+    name: "{{ tempo_obc_name }}"
+    namespace: "{{ istio_ns }}"
+  register: odf_cm
+  until: odf_cm.resources | length > 0
+  retries: 60
+  delay: 10
+
+- name: Create TempoStack S3 secret from ODF values
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: "{{ tempo_s3_secret }}"
+        namespace: "{{ istio_ns }}"
+      stringData:
+        access_key_id: "{{ odf_secret.resources[0].data.AWS_ACCESS_KEY_ID | b64decode }}"
+        access_key_secret: "{{ odf_secret.resources[0].data.AWS_SECRET_ACCESS_KEY | b64decode }}"
+        bucket: "{{ odf_cm.resources[0].data.BUCKET_NAME }}"
+        endpoint: "https://{{ odf_cm.resources[0].data.BUCKET_HOST }}"
+      type: Opaque
+
+- name: Apply TempoStack manifest (Tempo in ACM)
+  vars:
+    tempostack_manifest: "{{ role_path }}/../../../..//apps/tempo/base/tempostack.yaml"
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    src: "{{ tempostack_manifest }}"
+
+- name: Apply OTEL collector manifest (Tempo exporter in ACM)
+  vars:
+    otel_collector_manifest: "{{ role_path }}/../../../..//apps/otel/base/otel-collector.yaml"
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    src: "{{ otel_collector_manifest }}"
+
+- name: Expose OTLP/HTTP ingest Route on ACM (otel-collector:4318)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        name: otel-collector-http
+        namespace: "{{ istio_ns }}"
+      spec:
+        host: "{{ hostvars['localhost'].acm_otel_collector_http_host }}"
+        to:
+          kind: Service
+          name: otel-collector
+          weight: 100
+        port:
+          targetPort: http-otlp
+        wildcardPolicy: None
+
+- name: Expose Tempo query HTTP Route on ACM (optional)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        name: tempo-query-http
+        namespace: "{{ istio_ns }}"
+      spec:
+        host: "{{ hostvars['localhost'].acm_tempo_query_http_host }}"
+        to:
+          kind: Service
+          name: tempo-tempo-query-frontend
+          weight: 100
+        port:
+          targetPort: 3200
+        wildcardPolicy: None
+

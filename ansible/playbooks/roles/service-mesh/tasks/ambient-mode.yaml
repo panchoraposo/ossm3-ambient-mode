@@ -84,6 +84,9 @@
             trustedZtunnelNamespace: "{{ ztunnel_ns }}"
           meshConfig:
             enableTracing: true
+            defaultProviders:
+              tracing:
+                - "tempo-otlp"
             extensionProviders:
             - name: "tempo-otlp"
               opentelemetry:
@@ -114,6 +117,22 @@
     # Getting the secret directly is more reliable in a single block for sync
     CERT=$(oc get secret istio-ca-secret -n {{ istio_ns }} -o jsonpath='{.data.ca-cert\.pem}')
     oc create configmap istio-ca-root-cert -n {{ ztunnel_ns }} --from-literal=root-cert.pem="$(echo $CERT | base64 -d)" --dry-run=client -o yaml | oc apply -f -
+
+- name: Create ClusterRole for Ztunnel Impersonation (if missing)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: ztunnel-impersonation
+      rules:
+      - apiGroups: [""]
+        resources: ["serviceaccounts/token"]
+        verbs: ["create"]
+      - apiGroups: [""]
+        resources: ["serviceaccounts"]
+        verbs: ["impersonate"]
 
 - name: Create ClusterRoleBinding for Ztunnel Impersonation
   kubernetes.core.k8s:
@@ -155,7 +174,7 @@
             app: ztunnel
         podMetricsEndpoints:
         - path: /stats/prometheus
-          targetPort: 15020
+          portNumber: 15020
           interval: 30s
 
 # ==============================================================================

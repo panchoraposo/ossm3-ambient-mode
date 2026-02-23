@@ -1,0 +1,89 @@
+---
+- name: "Phase 1: Generate Certificates Locally"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    certs_dir: "/tmp/istio-certs"
+  tasks:
+    - name: Create certs directory
+      file:
+        path: "{{ certs_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create OpenSSL Extensions Config
+      copy:
+        dest: "{{ certs_dir }}/extensions.cnf"
+        content: |
+          [ v3_ca ]
+          basicConstraints = critical,CA:TRUE
+          keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid:always,issuer
+
+    - name: Generate Root CA
+      shell: |
+        if [ ! -f root-cert.pem ]; then
+          openssl req -new -newkey rsa:4096 -x509 -sha256 -days 3650 -nodes \
+          -keyout root-key.pem -out root-cert.pem -subj "/O=Istio/CN=Root CA" \
+          -extensions v3_ca -config extensions.cnf
+        fi
+      args:
+        chdir: "{{ certs_dir }}"
+
+    - name: Generate Intermediate Certs for Clusters
+      shell: |
+        # Generate CSR (certificate signing request)
+        openssl req -new -newkey rsa:4096 -nodes -keyout {{ item }}-ca-key.pem \
+        -out {{ item }}-ca-csr.pem -subj "/O=Istio/CN=Intermediate CA {{ item }}"
+        
+        # Sign the CSR using the root CA and APPLYING the v3_ca extensions
+        openssl x509 -req -days 3650 -CA root-cert.pem -CAkey root-key.pem -set_serial 100 \
+        -in {{ item }}-ca-csr.pem -out {{ item }}-ca-cert.pem \
+        -extfile extensions.cnf -extensions v3_ca
+        
+        # Build the cert chain
+        cat {{ item }}-ca-cert.pem root-cert.pem > {{ item }}-cert-chain.pem
+      args:
+        chdir: "{{ certs_dir }}"
+      loop: "{{ groups['clusters'] }}"
+
+- name: "Phase 2: Push Certificates to Clusters"
+  hosts: clusters
+  gather_facts: no
+  vars:
+    certs_dir: "/tmp/istio-certs"
+    istio_ns: "istio-system"
+  tasks:
+    - name: Ensure Python dependencies
+      pip: { name: ["kubernetes", "openshift"], state: present, extra_args: "--break-system-packages" }
+      delegate_to: localhost
+      ignore_errors: yes
+
+    - name: Create Istio Namespace
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ istio_ns }}"
+            labels: { istio-discovery: enabled }
+
+    - name: Create 'cacerts' Secret
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: cacerts
+            namespace: "{{ istio_ns }}"
+          data:
+            ca-cert.pem: "{{ lookup('file', certs_dir + '/' + inventory_hostname + '-ca-cert.pem') | b64encode }}"
+            ca-key.pem: "{{ lookup('file', certs_dir + '/' + inventory_hostname + '-ca-key.pem') | b64encode }}"
+            root-cert.pem: "{{ lookup('file', certs_dir + '/root-cert.pem') | b64encode }}"
+            cert-chain.pem: "{{ lookup('file', certs_dir + '/' + inventory_hostname + '-cert-chain.pem') | b64encode }}"

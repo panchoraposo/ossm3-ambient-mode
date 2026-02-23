@@ -1,0 +1,112 @@
+---
+- name: Create otel-collector ConfigMap (export to ACM via OTLP/HTTP)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: otel-collector-manual
+        namespace: "{{ istio_ns }}"
+        labels:
+          app: otel-collector
+      data:
+        config.yaml: |
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: "0.0.0.0:4317"
+                http:
+                  endpoint: "0.0.0.0:4318"
+            jaeger:
+              protocols:
+                grpc:
+                  endpoint: "0.0.0.0:14250"
+                thrift_http:
+                  endpoint: "0.0.0.0:14268"
+                thrift_compact:
+                  endpoint: "0.0.0.0:6831"
+          processors:
+            batch:
+              send_batch_size: 1024
+              timeout: 200ms
+          exporters:
+            otlphttp/acm:
+              endpoint: "{{ hostvars['localhost'].acm_otel_otlphttp_url }}"
+            debug:
+              verbosity: detailed
+          service:
+            pipelines:
+              traces:
+                receivers: [otlp, jaeger]
+                processors: [batch]
+                exporters: [otlphttp/acm, debug]
+
+- name: Ensure otel-collector Service exists
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: otel-collector
+        namespace: "{{ istio_ns }}"
+        annotations:
+          service.beta.openshift.io/serving-cert-secret-name: otel-collector-mtls
+      spec:
+        selector:
+          app: otel-collector
+        ports:
+        - name: grpc-otlp
+          port: 4317
+          targetPort: 4317
+          protocol: TCP
+        - name: http-otlp
+          port: 4318
+          targetPort: 4318
+          protocol: TCP
+
+- name: Ensure otel-collector Deployment exists
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: otel-collector
+        namespace: "{{ istio_ns }}"
+        labels:
+          app: otel-collector
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: otel-collector
+        template:
+          metadata:
+            labels:
+              app: otel-collector
+          spec:
+            containers:
+            - name: otel-collector
+              image: "{{ otel_image }}"
+              args:
+                - "--config=/etc/otelcol/config.yaml"
+              ports:
+              - containerPort: 4317
+              - containerPort: 4318
+              volumeMounts:
+              - name: otel-config
+                mountPath: /etc/otelcol
+            volumes:
+            - name: otel-config
+              configMap:
+                name: otel-collector-manual
+                items:
+                - key: config.yaml
+                  path: config.yaml
+

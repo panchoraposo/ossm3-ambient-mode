@@ -1,0 +1,132 @@
+---
+- name: Create Kiali multi-cluster secret (east + west) in acm
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: kiali-multi-cluster-secret
+    namespace: "{{ istio_ns }}"
+  ignore_errors: true
+
+- name: Set default clusters list for Kiali multicluster secret
+  set_fact:
+    kiali_mc_clusters: "{{ kiali_mc_clusters | default(groups['clusters']) }}"
+
+- name: Create Kiali multi-cluster secret (dynamic clusters) in acm
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition: "{{ lookup('template', 'kiali-multi-cluster-secret.yaml.j2') | from_yaml }}"
+
+- name: Ensure OperatorGroup exists for Kiali Operator
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: kiali-operator-group
+        namespace: "{{ kiali_namespace }}"
+      spec: {}
+
+- name: Subscribe to Kiali Operator (kiali-ossm)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: kiali-ossm
+        namespace: "{{ kiali_namespace }}"
+      spec:
+        channel: stable
+        installPlanApproval: Automatic
+        name: kiali-ossm
+        source: redhat-operators
+        sourceNamespace: openshift-marketplace
+
+- name: Wait for Kiali operator Deployment to appear
+  shell: |
+    set -e
+    oc --context {{ k8s_context }} -n {{ kiali_namespace }} get deploy kiali-operator >/dev/null
+  register: kiali_operator_deploy_check
+  retries: 60
+  delay: 10
+  until: kiali_operator_deploy_check.rc == 0
+  changed_when: false
+
+- name: Wait for Kiali operator Deployment rollout
+  shell: |
+    set -e
+    oc --context {{ k8s_context }} -n {{ kiali_namespace }} rollout status deploy/kiali-operator --timeout=300s
+  register: kiali_operator_rollout
+  changed_when: false
+
+- name: Wait for Kiali CRD to be installed (kialis.kiali.io)
+  shell: |
+    set -e
+    oc --context {{ k8s_context }} get crd kialis.kiali.io >/dev/null
+  register: kiali_crd_check
+  retries: 60
+  delay: 10
+  until: kiali_crd_check.rc == 0
+  changed_when: false
+
+- name: Deploy central Kiali (acm) - multicluster
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: kiali.io/v1alpha1
+      kind: Kiali
+      metadata:
+        name: kiali
+        namespace: "{{ istio_ns }}"
+      spec:
+        auth:
+          strategy: anonymous
+        clustering:
+          ignore_home_cluster: true
+          autodetect_secrets:
+            enabled: true
+            label: kiali.io/multiCluster=true
+        deployment:
+          accessible_namespaces: ["**"]
+          cluster_wide_access: true
+          instance_name: kiali
+        external_services:
+          prometheus:
+            url: "https://{{ promxy_host }}"
+            is_core: true
+            auth:
+              type: none
+          tracing:
+            enabled: true
+            provider: jaeger
+            internal_url: "{{ tempo_query_http_url }}"
+            use_grpc: false
+            query_timeout: 20
+          grafana:
+            enabled: false
+        kubernetes_config:
+          cluster_name: acm
+
+- name: Deploy OSSMConsole plugin (OpenShift Service Mesh Console)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: kiali.io/v1alpha1
+      kind: OSSMConsole
+      metadata:
+        name: ossmconsole
+        namespace: "{{ istio_ns }}"
+      spec:
+        version: default
+        kiali:
+          serviceName: kiali
+          serviceNamespace: "{{ istio_ns }}"
+

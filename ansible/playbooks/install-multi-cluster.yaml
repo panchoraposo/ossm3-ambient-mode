@@ -1,0 +1,124 @@
+---
+- name: Phase 1 - Generate and distribute certificates
+  import_playbook: roles/multi-cluster/tasks/trust.yaml
+
+- name: Phase 2 - Install Istio on East and West
+  import_playbook: roles/multi-cluster/tasks/install.yaml
+
+- name: Phase 3 - Exchange remote secrets (peering)
+  import_playbook: roles/multi-cluster/tasks/peering.yaml
+
+- name: Phase 3.5 - Configure multi-network (meshNetworks + eastwest gateway)
+  import_playbook: roles/multi-cluster/tasks/mesh-networks.yaml
+
+- name: Phase 4 - Install GitOps + Connectivity Link + Kuadrant on data clusters
+  hosts: clusters
+  gather_facts: false
+  vars_files:
+    - ../vars/demo.yaml
+  roles:
+    - role: gitops-config
+    - role: connectivity-link
+
+- name: Phase 5 - Deploy Bookinfo application
+  import_playbook: roles/multi-cluster/tasks/apps.yaml
+
+- name: Phase 6 - Discover ACM endpoints (tracing + promxy host)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ctx_acm: "acm"
+  tasks:
+    - name: Discover tracing endpoints (role)
+      import_role:
+        name: tracing-acm
+        tasks_from: discover.yaml
+      vars:
+        ctx_acm: "{{ ctx_acm }}"
+        istio_ns: "istio-system"
+
+    - name: Set Tempo query URL for Kiali (Jaeger Query API)
+      set_fact:
+        tempo_query_http_url: "http://tempo-tempo-query-frontend.istio-system.svc.cluster.local:16686"
+
+    - name: Get ACM OpenShift Ingress Domain (for promxy route)
+      ansible.builtin.shell: |
+        set -e
+        oc --context {{ ctx_acm }} get ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}'
+      register: acm_ingress_domain
+      changed_when: false
+
+    - name: Set promxy route host (acm)
+      set_fact:
+        promxy_host: "promxy-acm-observability.{{ acm_ingress_domain.stdout }}"
+
+- name: "Phase 7 - ACM hub: install Tempo + OTEL ingress collector"
+  hosts: acm
+  gather_facts: false
+  vars:
+    tempo_operator_ns: "openshift-tempo-operator"
+    istio_ns: "istio-system"
+    tempo_s3_secret: "tempo-demo-s3"
+    odf_storageclass_name: "openshift-storage.noobaa.io"
+    tempo_obc_name: "tempo-bucket-claim"
+  tasks:
+    - name: Install hub tracing stack (role)
+      import_role:
+        name: tracing-acm
+        tasks_from: hub.yaml
+
+- name: "Phase 8 - Data clusters: ensure OTEL collector exports traces to ACM"
+  hosts: clusters
+  gather_facts: false
+  vars:
+    istio_ns: "istio-system"
+    otel_image: "registry.redhat.io/rhosdt/opentelemetry-collector-rhel8:latest"
+  tasks:
+    - name: Configure data clusters OTEL export to ACM (role)
+      import_role:
+        name: tracing-acm
+        tasks_from: data-clusters.yaml
+
+- name: "Phase 9 - Remote access on data clusters (for ACM Kiali + promxy)"
+  hosts: clusters
+  gather_facts: false
+  vars:
+    istio_ns: "istio-system"
+    ztunnel_ns: "ztunnel"
+    kiali_remote_sa: "kiali-remote-service-account"
+    metrics_reader_sa: "acm-thanos-reader"
+  tasks:
+    - name: Configure remote access (role)
+      import_role:
+        name: acm-observability
+        tasks_from: remote-access.yaml
+
+- name: "Phase 10 - ACM hub: promxy + Kiali multicluster"
+  hosts: acm
+  gather_facts: false
+  vars:
+    acm_obs_ns: "acm-observability"
+    istio_ns: "istio-system"
+    promxy_name: "promxy"
+    kiali_namespace: "kiali-operator"
+  tasks:
+    - name: Capture upstream Thanos route hosts (east/west)
+      import_role:
+        name: acm-observability
+        tasks_from: expose-thanos-remote.yaml
+
+    - name: Deploy hub metrics endpoint (promxy)
+      import_role:
+        name: acm-observability
+        tasks_from: thanos-root.yaml
+      vars:
+        promxy_host: "{{ hostvars['localhost'].promxy_host }}"
+
+    - name: Deploy central Kiali multicluster (acm)
+      import_role:
+        name: acm-observability
+        tasks_from: kiali-central.yaml
+      vars:
+        promxy_host: "{{ hostvars['localhost'].promxy_host }}"
+        tempo_query_http_url: "{{ hostvars['localhost'].tempo_query_http_url }}"

@@ -1,0 +1,164 @@
+---
+- name: Ensure namespaces exist (acm-observability + istio-system + kiali-operator)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ item }}"
+  loop:
+    - "{{ acm_obs_ns }}"
+    - "{{ istio_ns }}"
+    - "{{ kiali_namespace }}"
+
+- name: Set default clusters list for promxy fan-out
+  set_fact:
+    promxy_clusters: "{{ promxy_clusters | default(groups['clusters']) }}"
+
+- name: Build promxy upstream tokens secret stringData
+  set_fact:
+    promxy_upstream_tokens_stringData: "{{ promxy_upstream_tokens_stringData | default({}) | combine({ (item ~ '.token'): hostvars[item].metrics_reader_token_value }) }}"
+  loop: "{{ promxy_clusters }}"
+
+- name: Build promxy hostAliases (pin Thanos route hosts to IPs)
+  set_fact:
+    promxy_hostAliases: "{{ promxy_hostAliases | default([]) + [ {'ip': thanos_route_ip_by_cluster[item], 'hostnames': [thanos_route_host_by_cluster[item]] } ] }}"
+  loop: "{{ promxy_clusters }}"
+
+- name: Create promxy upstream tokens secret
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: promxy-upstream-tokens
+    namespace: "{{ acm_obs_ns }}"
+  ignore_errors: true
+
+- name: Create promxy upstream tokens secret
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: promxy-upstream-tokens
+        namespace: "{{ acm_obs_ns }}"
+    # Tokens are cluster-scoped; keep them only in the hub cluster.
+      stringData: "{{ promxy_upstream_tokens_stringData }}"
+
+- name: Create/Update promxy config (fan-out to east + west Thanos routes)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: promxy-config
+        namespace: "{{ acm_obs_ns }}"
+      data:
+        config.yaml: |
+          promxy:
+            server_groups:
+          {% for c in promxy_clusters %}
+              - static_configs:
+                  - targets:
+                      - {{ thanos_route_host_by_cluster[c] }}
+                scheme: https
+                http_client:
+                  tls_config:
+                    insecure_skip_verify: true
+                  bearer_token_file: /etc/promxy-tokens/{{ c }}.token
+          {% endfor %}
+
+- name: Deploy promxy
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: "{{ promxy_name }}"
+        namespace: "{{ acm_obs_ns }}"
+        labels:
+          app: "{{ promxy_name }}"
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: "{{ promxy_name }}"
+        template:
+          metadata:
+            labels:
+              app: "{{ promxy_name }}"
+          spec:
+            # Avoid DNS timeouts during large fan-out PromQL queries by pinning
+            # Thanos route hosts to their current router IPs (PoC hardening).
+            hostAliases: "{{ promxy_hostAliases }}"
+            containers:
+              - name: promxy
+                image: quay.io/jacksontj/promxy:v0.0.92
+                args:
+                  - "--config=/etc/promxy/config.yaml"
+                  - "--bind-addr=0.0.0.0:8082"
+                ports:
+                  - name: http
+                    containerPort: 8082
+                volumeMounts:
+                  - name: config
+                    mountPath: /etc/promxy
+                  - name: tokens
+                    mountPath: /etc/promxy-tokens
+                    readOnly: true
+            volumes:
+              - name: config
+                configMap:
+                  name: promxy-config
+              - name: tokens
+                secret:
+                  secretName: promxy-upstream-tokens
+
+- name: Expose promxy service
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: "{{ promxy_name }}"
+        namespace: "{{ acm_obs_ns }}"
+      spec:
+        selector:
+          app: "{{ promxy_name }}"
+        ports:
+          - name: http
+            port: 8082
+            targetPort: http
+
+- name: Expose promxy Route (acm)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        name: "{{ promxy_name }}"
+        namespace: "{{ acm_obs_ns }}"
+      spec:
+        host: "{{ promxy_host }}"
+        to:
+          kind: Service
+          name: "{{ promxy_name }}"
+        port:
+          targetPort: http
+        tls:
+          termination: edge
+          insecureEdgeTerminationPolicy: Redirect
+

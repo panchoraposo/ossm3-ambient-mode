@@ -1,6 +1,7 @@
 ---
 - name: Create openshift-gitops-operator namespace
-  k8s:
+  kubernetes.core.k8s:
+    context: "{{ k8s_context | default(omit) }}"
     api_version: v1
     kind: Namespace
     name: openshift-gitops-operator
@@ -9,15 +10,17 @@
 - name: Render OperatorGroup and Subscription manifest
   template:
     src: templates/gitops-subscription.yaml.j2
-    dest: "{{ output_file }}"
+    dest: "/tmp/gitops-subscription-{{ inventory_hostname }}.yaml"
 
 - name: Apply OperatorGroup and Subscription
   kubernetes.core.k8s:
+    context: "{{ k8s_context | default(omit) }}"
     state: present
-    src: "{{ output_file }}"
+    src: "/tmp/gitops-subscription-{{ inventory_hostname }}.yaml"
 
 - name: Wait for GitOps Operator CSV to be succeeded
-  k8s_info:
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context | default(omit) }}"
     api_version: operators.coreos.com/v1alpha1
     kind: ClusterServiceVersion
     namespace: openshift-gitops-operator
@@ -30,6 +33,7 @@
 
 - name: Wait for GitOps Operator Deployment to be ready
   kubernetes.core.k8s_info:
+    context: "{{ k8s_context | default(omit) }}"
     api_version: apps/v1
     kind: Deployment
     name: openshift-gitops-operator-controller-manager
@@ -44,7 +48,7 @@
 
 - name: Wait for ArgoCD webhook service endpoints
   shell: >
-    oc get endpoints openshift-gitops-operator-controller-manager-service -n openshift-gitops-operator -o jsonpath="{.subsets}"
+    oc{{ (' --context ' ~ k8s_context) if (k8s_context is defined) else '' }} get endpoints openshift-gitops-operator-controller-manager-service -n openshift-gitops-operator -o jsonpath="{.subsets}"
   register: webhook_endpoints
   until: webhook_endpoints.stdout != ""
   retries: 20
@@ -52,6 +56,7 @@
 
 - name: Create openshift-gitops namespace
   kubernetes.core.k8s:
+    context: "{{ k8s_context | default(omit) }}"
     state: present
     definition:
       apiVersion: v1
@@ -61,6 +66,7 @@
 
 - name: Create ArgoCD instance in openshift-gitops
   kubernetes.core.k8s:
+    context: "{{ k8s_context | default(omit) }}"
     state: present
     definition:
       apiVersion: argoproj.io/v1alpha1
@@ -71,6 +77,7 @@
 
 - name: Wait for ArgoCD server deployment to be ready
   kubernetes.core.k8s_info:
+    context: "{{ k8s_context | default(omit) }}"
     api_version: apps/v1
     kind: Deployment
     name: openshift-gitops-server
@@ -85,6 +92,7 @@
 
 - name: "Grant cluster-admin to ArgoCD Application Controller"
   kubernetes.core.k8s:
+    context: "{{ k8s_context | default(omit) }}"
     state: present
     definition:
       apiVersion: rbac.authorization.k8s.io/v1
@@ -102,6 +110,7 @@
 
 - name: "Patch ArgoCD Controller resources (Fix OOMKilled)"
   kubernetes.core.k8s:
+    context: "{{ k8s_context | default(omit) }}"
     state: patched
     api_version: argoproj.io/v1alpha1
     kind: ArgoCD

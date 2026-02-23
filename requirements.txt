@@ -1,0 +1,5 @@
+ansible
+kubernetes
+openshift
+PyYAML
+jmespath

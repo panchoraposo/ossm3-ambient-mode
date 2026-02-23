@@ -1,0 +1,281 @@
+---
+- name: "Phase 3.5 - Configure multi-network (eastwest gateway + meshNetworks)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    istio_ns: "istio-system"
+    ctx_east: "east"
+    ctx_west: "west"
+    eastwest_gw_name: "istio-eastwestgateway"
+    eastwest_svc_name: "istio-eastwestgateway"
+    eastwest_https_svc_name: "istio-eastwestgateway-https"
+    eastwest_port: 15008
+  tasks:
+    - name: Label istio-system namespace with default network on East
+      kubernetes.core.k8s:
+        context: "{{ ctx_east }}"
+        state: patched
+        api_version: v1
+        kind: Namespace
+        name: "{{ istio_ns }}"
+        definition:
+          metadata:
+            labels:
+              topology.istio.io/network: "network1"
+
+    - name: Label istio-system namespace with default network on West
+      kubernetes.core.k8s:
+        context: "{{ ctx_west }}"
+        state: patched
+        api_version: v1
+        kind: Namespace
+        name: "{{ istio_ns }}"
+        definition:
+          metadata:
+            labels:
+              topology.istio.io/network: "network2"
+
+    - name: Ensure east-west Gateway on East (HBONE)
+      kubernetes.core.k8s:
+        context: "{{ ctx_east }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: "{{ eastwest_gw_name }}"
+            namespace: "{{ istio_ns }}"
+            annotations:
+              networking.istio.io/service-type: LoadBalancer
+          spec:
+            gatewayClassName: istio-waypoint
+            listeners:
+            - name: mesh
+              port: "{{ eastwest_port }}"
+              protocol: HBONE
+              tls:
+                mode: Terminate
+                options:
+                  gateway.istio.io/tls-terminate-mode: ISTIO_MUTUAL
+
+    - name: Ensure east-west Gateway on West (HBONE)
+      kubernetes.core.k8s:
+        context: "{{ ctx_west }}"
+        state: present
+        definition:
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: "{{ eastwest_gw_name }}"
+            namespace: "{{ istio_ns }}"
+            annotations:
+              networking.istio.io/service-type: LoadBalancer
+          spec:
+            gatewayClassName: istio-waypoint
+            listeners:
+            - name: mesh
+              port: "{{ eastwest_port }}"
+              protocol: HBONE
+              tls:
+                mode: Terminate
+                options:
+                  gateway.istio.io/tls-terminate-mode: ISTIO_MUTUAL
+
+    - name: Ensure HTTPS Service for east-west gateway on East (443 -> 15008)
+      kubernetes.core.k8s:
+        context: "{{ ctx_east }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ eastwest_https_svc_name }}"
+            namespace: "{{ istio_ns }}"
+          spec:
+            selector:
+              gateway.networking.k8s.io/gateway-name: "{{ eastwest_gw_name }}"
+            ports:
+            - name: mesh-https
+              port: 443
+              protocol: TCP
+              targetPort: "{{ eastwest_port }}"
+
+    - name: Ensure HTTPS Service for east-west gateway on West (443 -> 15008)
+      kubernetes.core.k8s:
+        context: "{{ ctx_west }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ eastwest_https_svc_name }}"
+            namespace: "{{ istio_ns }}"
+          spec:
+            selector:
+              gateway.networking.k8s.io/gateway-name: "{{ eastwest_gw_name }}"
+            ports:
+            - name: mesh-https
+              port: 443
+              protocol: TCP
+              targetPort: "{{ eastwest_port }}"
+
+    - name: Ensure passthrough Route for eastwest gateway on East
+      kubernetes.core.k8s:
+        context: "{{ ctx_east }}"
+        state: present
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: "{{ eastwest_gw_name }}"
+            namespace: "{{ istio_ns }}"
+          spec:
+            to:
+              kind: Service
+              name: "{{ eastwest_https_svc_name }}"
+            port:
+              targetPort: 443
+            tls:
+              termination: passthrough
+            wildcardPolicy: None
+
+    - name: Ensure passthrough Route for eastwest gateway on West
+      kubernetes.core.k8s:
+        context: "{{ ctx_west }}"
+        state: present
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: "{{ eastwest_gw_name }}"
+            namespace: "{{ istio_ns }}"
+          spec:
+            to:
+              kind: Service
+              name: "{{ eastwest_https_svc_name }}"
+            port:
+              targetPort: 443
+            tls:
+              termination: passthrough
+            wildcardPolicy: None
+
+    - name: Wait for East route hostname
+      kubernetes.core.k8s_info:
+        context: "{{ ctx_east }}"
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: "{{ eastwest_gw_name }}"
+        namespace: "{{ istio_ns }}"
+      register: east_route
+      until: east_route.resources | length > 0 and (east_route.resources[0].spec.host | default('') | length > 0)
+      retries: 60
+      delay: 5
+
+    - name: Wait for West route hostname
+      kubernetes.core.k8s_info:
+        context: "{{ ctx_west }}"
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: "{{ eastwest_gw_name }}"
+        namespace: "{{ istio_ns }}"
+      register: west_route
+      until: west_route.resources | length > 0 and (west_route.resources[0].spec.host | default('') | length > 0)
+      retries: 60
+      delay: 5
+
+    - name: Compute east-west gateway addresses (via Route host)
+      set_fact:
+        east_gw_addr: "{{ east_route.resources[0].spec.host }}"
+        west_gw_addr: "{{ west_route.resources[0].spec.host }}"
+        eastwest_public_port: 443
+
+    - name: Patch global.meshNetworks in East (Istio CR)
+      kubernetes.core.k8s:
+        context: "{{ ctx_east }}"
+        state: patched
+        api_version: sailoperator.io/v1
+        kind: Istio
+        name: default
+        namespace: "{{ istio_ns }}"
+        definition:
+          spec:
+            values:
+              global:
+                meshNetworks:
+                  network1:
+                    endpoints:
+                    - fromRegistry: east
+                    gateways:
+                    - address: "{{ east_gw_addr }}"
+                      port: "{{ eastwest_public_port }}"
+                  network2:
+                    endpoints:
+                    - fromRegistry: west
+                    gateways:
+                    - address: "{{ west_gw_addr }}"
+                      port: "{{ eastwest_public_port }}"
+
+    - name: Patch global.meshNetworks in West (Istio CR)
+      kubernetes.core.k8s:
+        context: "{{ ctx_west }}"
+        state: patched
+        api_version: sailoperator.io/v1
+        kind: Istio
+        name: default
+        namespace: "{{ istio_ns }}"
+        definition:
+          spec:
+            values:
+              global:
+                meshNetworks:
+                  network1:
+                    endpoints:
+                    - fromRegistry: east
+                    gateways:
+                    - address: "{{ east_gw_addr }}"
+                      port: "{{ eastwest_public_port }}"
+                  network2:
+                    endpoints:
+                    - fromRegistry: west
+                    gateways:
+                    - address: "{{ west_gw_addr }}"
+                      port: "{{ eastwest_public_port }}"
+
+    - name: Remove stray meshNetworks key "networks" in East (if present)
+      shell: >
+        oc --context {{ ctx_east }} patch istio default -n {{ istio_ns }}
+        --type='json'
+        -p='[{"op":"remove","path":"/spec/values/global/meshNetworks/networks"}]'
+      register: rm_networks_east
+      failed_when: false
+      changed_when: rm_networks_east.rc == 0
+
+    - name: Remove stray meshNetworks key "networks" in West (if present)
+      shell: >
+        oc --context {{ ctx_west }} patch istio default -n {{ istio_ns }}
+        --type='json'
+        -p='[{"op":"remove","path":"/spec/values/global/meshNetworks/networks"}]'
+      register: rm_networks_west
+      failed_when: false
+      changed_when: rm_networks_west.rc == 0
+
+    - name: Restart istiod on East (pick up meshNetworks)
+      kubernetes.core.k8s:
+        context: "{{ ctx_east }}"
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ istio_ns }}"
+        label_selectors:
+          - app=istiod
+
+    - name: Restart istiod on West (pick up meshNetworks)
+      kubernetes.core.k8s:
+        context: "{{ ctx_west }}"
+        state: absent
+        api_version: v1
+        kind: Pod
+        namespace: "{{ istio_ns }}"
+        label_selectors:
+          - app=istiod

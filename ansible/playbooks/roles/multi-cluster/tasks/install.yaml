@@ -1,0 +1,278 @@
+---
+- name: Install and Configure Istio Service Mesh (Multi-Cluster)
+  hosts: clusters
+  gather_facts: no
+  vars:
+    istio_ns: "istio-system"
+    ztunnel_ns: "ztunnel"
+    operator_namespace: openshift-operators
+    operator_channel: "stable"
+  
+  tasks:
+    - name: Enable User Workload Monitoring
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cluster-monitoring-config
+            namespace: openshift-monitoring
+          data:
+            config.yaml: |
+              enableUserWorkload: true
+
+    - name: Create Subscription for Service Mesh 3
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: operators.coreos.com/v1alpha1
+          kind: Subscription
+          metadata:
+            name: servicemeshoperator3
+            namespace: "{{ operator_namespace }}"
+          spec:
+            channel: "{{ operator_channel }}"
+            installPlanApproval: Automatic
+            name: servicemeshoperator3
+            source: redhat-operators
+            sourceNamespace: openshift-marketplace
+
+    - name: Wait for Operator to be Ready (CSV Installed)
+      kubernetes.core.k8s_info:
+        context: "{{ k8s_context }}"
+        api_version: operators.coreos.com/v1alpha1
+        kind: ClusterServiceVersion
+        namespace: "{{ operator_namespace }}"
+      register: csv_list
+      until: >-
+        csv_list.resources 
+        | selectattr('spec.displayName', 'search', 'Service Mesh') 
+        | selectattr('status.phase', 'equalto', 'Succeeded') 
+        | list | length > 0
+      retries: 60
+      delay: 10
+      ignore_errors: yes
+    
+    - name: Configure Infrastructure Namespaces
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item.name }}"
+            labels: "{{ item.labels }}"
+      loop:
+        - name: "{{ ztunnel_ns }}"
+          labels: 
+            pod-security.kubernetes.io/enforce: privileged
+            istio-discovery: enabled
+            istio.io/dataplane-mode: ambient
+        - name: "istio-cni"
+          labels: 
+            pod-security.kubernetes.io/enforce: privileged
+            openshift.io/cluster-monitoring: "true"
+
+    - name: Grant Privileged SCC to CNI and Ztunnel
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: "istio-privileged-{{ item.sa }}"
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:openshift:scc:privileged
+          subjects:
+          - kind: ServiceAccount
+            name: "{{ item.sa }}"
+            namespace: "{{ item.ns }}"
+      loop:
+        - { sa: "ztunnel", ns: "{{ ztunnel_ns }}" }
+        - { sa: "istio-cni", ns: "istio-cni" }
+
+    - name: Deploy IstioCNI
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        definition:
+          apiVersion: sailoperator.io/v1
+          kind: IstioCNI
+          metadata: 
+            name: default
+            namespace: "istio-cni"
+          spec:
+            profile: ambient
+            values:
+              cni:
+                ambient: 
+                  enabled: true
+                  dnsCapture: false
+
+    - name: Deploy Istio Control Plane
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        definition:
+          apiVersion: sailoperator.io/v1
+          kind: Istio
+          metadata: 
+            name: default
+            namespace: "{{ istio_ns }}"
+          spec:
+            profile: ambient
+            values:
+              global:
+                meshID: "{{ mesh_id }}"
+                network: "{{ cluster_network }}"
+                multiCluster:
+                  enabled: true
+                  clusterName: "{{ inventory_hostname }}"
+              pilot:
+                trustedZtunnelNamespace: "{{ ztunnel_ns }}"
+              meshConfig:
+                trustDomain: "cluster.local"
+                enableTracing: true
+                defaultProviders:
+                  tracing:
+                    - "tempo-otlp"
+                defaultConfig:
+                  tracing:
+                    sampling: 100.0
+                extensionProviders:
+                - name: "tempo-otlp"
+                  opentelemetry:
+                    service: "otel-collector.istio-system.svc.cluster.local"
+                    port: 4317
+
+    - name: Deploy ZTunnel
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        definition:
+          apiVersion: sailoperator.io/v1
+          kind: ZTunnel
+          metadata: 
+            name: default
+            namespace: "{{ istio_ns }}"
+          spec:
+            namespace: "{{ ztunnel_ns }}"
+            profile: ambient
+            values:
+              ztunnel:
+                multiCluster:
+                  clusterName: "{{ inventory_hostname }}"
+            podMetadata:
+              annotations:
+                sidecar.istio.io/inject: "false"
+                ambient.istio.io/redirection: "disabled"
+
+    - name: Create PodMonitor for Ztunnel
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: monitoring.coreos.com/v1
+          kind: PodMonitor
+          metadata:
+            name: ztunnel-monitor
+            namespace: "{{ ztunnel_ns }}"
+            labels:
+              k8s-app: ztunnel-monitor
+          spec:
+            selector:
+              matchLabels:
+                app: ztunnel
+            podMetricsEndpoints:
+            - path: /stats/prometheus
+              portNumber: 15020
+              interval: 30s
+
+    - name: Configure Mesh-wide Telemetry for Tracing
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        definition:
+          apiVersion: telemetry.istio.io/v1
+          kind: Telemetry
+          metadata:
+            name: mesh-default
+            namespace: "{{ istio_ns }}"
+          spec:
+            metrics:
+            - providers:
+              - name: prometheus
+            tracing:
+            - providers:
+              - name: "tempo-otlp"
+              randomSamplingPercentage: 100
+
+    - name: Sync CA certs to Ztunnel (root cert for Istiod verification)
+      shell: |
+        CERT=$(oc --context {{ k8s_context }} get secret istio-ca-secret -n {{ istio_ns }} -o jsonpath='{.data.ca-cert\.pem}' 2>/dev/null)
+        if [ -z "$CERT" ]; then
+          CERT=$(oc --context {{ k8s_context }} get secret cacerts -n {{ istio_ns }} -o jsonpath='{.data.root-cert\.pem}')
+        fi
+        if [ -z "$CERT" ]; then
+          CERT=$(oc --context {{ k8s_context }} get secret cacerts -n {{ istio_ns }} -o jsonpath='{.data.cert-chain\.pem}')
+        fi
+        oc --context {{ k8s_context }} create configmap istio-ca-root-cert -n {{ ztunnel_ns }} \
+          --from-literal=root-cert.pem="$(echo $CERT | base64 -d)" \
+          --dry-run=client -o yaml | oc --context {{ k8s_context }} apply -f -
+
+    - name: Create ClusterRole for Ztunnel Impersonation (if missing)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: ztunnel-impersonation
+          rules:
+          - apiGroups: [""]
+            resources: ["serviceaccounts/token"]
+            verbs: ["create"]
+          - apiGroups: [""]
+            resources: ["serviceaccounts"]
+            verbs: ["impersonate"]
+
+    - name: Create ClusterRoleBinding for Ztunnel Impersonation
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: ztunnel-impersonation
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: ztunnel-impersonation
+          subjects:
+          - kind: ServiceAccount
+            name: ztunnel
+            namespace: "{{ ztunnel_ns }}"
+          - kind: ServiceAccount
+            name: default
+            namespace: "{{ ztunnel_ns }}"
+
+    - name: Restart Istiod (To pick up new CA Certs)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: absent
+        kind: Pod
+        namespace: "{{ istio_ns }}"
+        label_selectors:
+          - app=istiod
+
+    - name: Restart Ztunnel (To pick up new Identity)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: absent
+        kind: Pod
+        namespace: "{{ ztunnel_ns }}"
+        label_selectors:
+          - app=ztunnel

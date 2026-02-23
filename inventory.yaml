@@ -1,0 +1,27 @@
+all:
+  children:
+    clusters:
+      hosts:
+        east:
+          k8s_context: east
+          cluster_network: network1
+          mesh_id: mesh1
+          tempo_distributor_service: "tempo-tempo-distributor.istio-system.svc.cluster.local"
+
+        west:
+          k8s_context: west
+          cluster_network: network2
+          mesh_id: mesh1
+          tempo_distributor_service: "tempo-tempo-distributor.istio-system.svc.cluster.local"
+    hub:
+      hosts:
+        # ACM hub cluster (used for central observability + Kiali multicluster)
+        acm:
+          k8s_context: acm
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: python3
+    istio_ns: istio-system
+    ztunnel_ns: ztunnel
+    app_ns: bookinfo
+    certs_dir: "/tmp/istio-certs"

@@ -1,0 +1,14 @@
+---
+- name: Get ACM OpenShift Ingress Domain
+  ansible.builtin.shell: |
+    set -e
+    oc --context {{ ctx_acm }} get ingress.config.openshift.io/cluster -o jsonpath='{.spec.domain}'
+  register: acm_ingress_domain
+  changed_when: false
+
+- name: Set facts for ACM tracing endpoints
+  set_fact:
+    acm_tempo_query_http_host: "tempo-query-http.{{ acm_ingress_domain.stdout }}"
+    acm_otel_collector_http_host: "otel-collector-http.{{ acm_ingress_domain.stdout }}"
+    acm_otel_otlphttp_url: "http://otel-collector-http.{{ acm_ingress_domain.stdout }}"
+

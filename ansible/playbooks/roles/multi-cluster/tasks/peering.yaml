@@ -1,0 +1,134 @@
+---
+- name: Exchange Remote Secrets (Peering)
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  vars:
+    istio_ns: "istio-system"
+    clusters: "{{ groups['clusters'] | default([]) }}"
+  
+  tasks:
+    - name: Assert two clusters are defined
+      assert:
+        that:
+          - clusters | length == 2
+        fail_msg: "Exactly 2 hosts are required in the 'clusters' group (e.g. east and west)."
+
+    - name: Set cluster facts
+      set_fact:
+        c1: "{{ clusters[0] }}"
+        c2: "{{ clusters[1] }}"
+        ctx1: "{{ hostvars[clusters[0]].k8s_context }}"
+        ctx2: "{{ hostvars[clusters[1]].k8s_context }}"
+
+    - name: Get Cluster 2 API Server Endpoint
+      shell: "oc --context {{ ctx2 }} config view --minify -o jsonpath='{.clusters[0].cluster.server}'"
+      register: c2_server
+      changed_when: false
+
+    - name: Get Cluster 2 CA Certificate
+      shell: "oc --context {{ ctx2 }} get cm kube-root-ca.crt -n {{ istio_ns }} -o jsonpath='{.data.ca\\.crt}'"
+      register: c2_ca
+      changed_when: false
+
+    - name: Ensure istio-reader-service-account exists on Cluster 2
+      shell: "oc --context {{ ctx2 }} -n {{ istio_ns }} get sa istio-reader-service-account >/dev/null 2>&1 || oc --context {{ ctx2 }} -n {{ istio_ns }} create sa istio-reader-service-account"
+      changed_when: false
+
+    - name: Create Cluster 2 ServiceAccount Token
+      shell: "oc --context {{ ctx2 }} create token istio-reader-service-account -n {{ istio_ns }} --duration=87600h"
+      register: c2_token
+      changed_when: false
+
+    - name: Build kubeconfig content for Cluster 2
+      set_fact:
+        c2_kubeconfig: |
+          apiVersion: v1
+          clusters:
+          - cluster:
+              server: {{ c2_server.stdout }}
+              insecure-skip-tls-verify: true
+            name: {{ c2 }}
+          contexts:
+          - context:
+              cluster: {{ c2 }}
+              user: {{ c2 }}
+            name: {{ c2 }}
+          current-context: {{ c2 }}
+          kind: Config
+          users:
+          - name: {{ c2 }}
+            user:
+              token: {{ c2_token.stdout }}
+
+    - name: Create Remote Secret in Cluster 1 (pointing to Cluster 2)
+      kubernetes.core.k8s:
+        context: "{{ ctx1 }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "istio-remote-secret-{{ c2 }}"
+            namespace: "{{ istio_ns }}"
+            labels: 
+              istio/multiCluster: "true"
+              kiali.io/multiCluster: "true"
+            annotations: 
+              networking.istio.io/cluster: "{{ c2 }}"
+          stringData: "{{ { (c2): c2_kubeconfig } }}"
+
+    - name: Get Cluster 1 API Server Endpoint
+      shell: "oc --context {{ ctx1 }} config view --minify -o jsonpath='{.clusters[0].cluster.server}'"
+      register: c1_server
+      changed_when: false
+
+    - name: Get Cluster 1 CA Certificate
+      shell: "oc --context {{ ctx1 }} get cm kube-root-ca.crt -n {{ istio_ns }} -o jsonpath='{.data.ca\\.crt}'"
+      register: c1_ca
+      changed_when: false
+
+    - name: Ensure istio-reader-service-account exists on Cluster 1
+      shell: "oc --context {{ ctx1 }} -n {{ istio_ns }} get sa istio-reader-service-account >/dev/null 2>&1 || oc --context {{ ctx1 }} -n {{ istio_ns }} create sa istio-reader-service-account"
+      changed_when: false
+
+    - name: Create Cluster 1 ServiceAccount Token
+      shell: "oc --context {{ ctx1 }} create token istio-reader-service-account -n {{ istio_ns }} --duration=87600h"
+      register: c1_token
+      changed_when: false
+
+    - name: Build kubeconfig content for Cluster 1
+      set_fact:
+        c1_kubeconfig: |
+          apiVersion: v1
+          clusters:
+          - cluster:
+              server: {{ c1_server.stdout }}
+              insecure-skip-tls-verify: true
+            name: {{ c1 }}
+          contexts:
+          - context:
+              cluster: {{ c1 }}
+              user: {{ c1 }}
+            name: {{ c1 }}
+          current-context: {{ c1 }}
+          kind: Config
+          users:
+          - name: {{ c1 }}
+            user:
+              token: {{ c1_token.stdout }}
+
+    - name: Create Remote Secret in Cluster 2 (pointing to Cluster 1)
+      kubernetes.core.k8s:
+        context: "{{ ctx2 }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "istio-remote-secret-{{ c1 }}"
+            namespace: "{{ istio_ns }}"
+            labels: 
+              istio/multiCluster: "true"
+              kiali.io/multiCluster: "true"
+            annotations: 
+              networking.istio.io/cluster: "{{ c1 }}"
+          stringData: "{{ { (c1): c1_kubeconfig } }}"

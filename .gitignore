@@ -18,3 +18,9 @@
 *.pem
 *.key
 ansible/venv/
+venv/
+.venv/
+
+# Local/demo artifacts (do not commit)
+token*.yaml
+token-for-*.yaml

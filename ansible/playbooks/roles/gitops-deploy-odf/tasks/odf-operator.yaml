@@ -1,5 +1,5 @@
 ---
-- name: "Crear aplicación ArgoCD para instalar el ODF Operator"
+- name: Create Argo CD application to install ODF Operator
   kubernetes.core.k8s:
     state: present
     definition:
@@ -14,7 +14,7 @@
         destination: { server: https://kubernetes.default.svc }
         syncPolicy: { automated: { prune: true, selfHeal: true }, syncOptions: [ "CreateNamespace=true" ] }
 
-- name: "Esperar a que el ODF Operator se instale correctamente (CSV Succeeded)"
+- name: Wait for ODF Operator to be installed (CSV Succeeded)
   kubernetes.core.k8s_info:
     api_version: operators.coreos.com/v1alpha1
     kind: ClusterServiceVersion
@@ -30,16 +30,16 @@
   delay: 10
   changed_when: false
 
-- name: "Obtener todos los nodos del clúster"
+- name: Get all cluster nodes
   kubernetes.core.k8s_info:
     kind: Node
   register: all_nodes
 
-- name: "Determinar los nodos de destino para ODF (SNO o Multi-Nodo)"
+- name: Determine target nodes for ODF (SNO or multi-node)
   ansible.builtin.set_fact:
     odf_target_nodes: "{{ all_nodes.resources if (all_nodes.resources | length) == 1 else (all_nodes.resources | selectattr('metadata.labels.\"node-role.kubernetes.io/worker\"', 'defined')) | list }}"
 
-- name: "Etiquetar los nodos de destino para ODF"
+- name: Label target nodes for ODF
   ansible.builtin.command: >
     oc label node {{ item.metadata.name }} cluster.ocs.openshift.io/openshift-storage='' --overwrite
   loop: "{{ odf_target_nodes }}"
@@ -48,7 +48,7 @@
   register: label_result
   changed_when: "'labeled' in label_result.stdout"
 
-- name: "Crear aplicación ArgoCD para la instancia de ODF MCG (StorageSystem)"
+- name: Create Argo CD application for ODF MCG instance (StorageSystem)
   kubernetes.core.k8s:
     state: present
     definition:
@@ -70,7 +70,7 @@
           jsonPointers:
           - /metadata/ownerReferences
 
-- name: Esperar a que el CSV de ODF se instale correctamente
+- name: Wait for ODF CSV to be installed
   kubernetes.core.k8s_info:
     api_version: operators.coreos.com/v1alpha1
     kind: ClusterServiceVersion
@@ -83,7 +83,7 @@
   retries: 30
   delay: 20
 
-- name: Verificar que la CRD StorageCluster ya existe
+- name: Verify StorageCluster CRD exists
   kubernetes.core.k8s_info:
     api_version: apiextensions.k8s.io/v1
     kind: CustomResourceDefinition
@@ -93,7 +93,7 @@
   retries: 20
   delay: 15
 
-- name: "Esperar a que la instancia de NooBaa esté lista (Phase: Ready)"
+- name: Wait for NooBaa instance to be ready (Phase: Ready)
   kubernetes.core.k8s_info:
     api_version: noobaa.io/v1alpha1
     kind: NooBaa

@@ -1,0 +1,283 @@
+---
+- name: Deploy Distributed Bookinfo Application
+  hosts: clusters
+  gather_facts: no
+  vars:
+    app_ns: "bookinfo"
+  
+  tasks:
+    - name: Create Bookinfo Namespace
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ app_ns }}"
+            labels:
+              istio.io/dataplane-mode: ambient
+              istio-discovery: enabled
+              openshift.io/user-monitoring: "true"
+
+    - name: Deploy per-service waypoints (reviews/ratings/details)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition: "{{ item }}"
+      loop:
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: reviews-waypoint
+            namespace: "{{ app_ns }}"
+            labels:
+              istio.io/waypoint-for: all
+          spec:
+            gatewayClassName: istio-waypoint
+            listeners:
+            - name: mesh
+              port: 15008
+              protocol: HBONE
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: ratings-waypoint
+            namespace: "{{ app_ns }}"
+            labels:
+              istio.io/waypoint-for: all
+          spec:
+            gatewayClassName: istio-waypoint
+            listeners:
+            - name: mesh
+              port: 15008
+              protocol: HBONE
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: details-waypoint
+            namespace: "{{ app_ns }}"
+            labels:
+              istio.io/waypoint-for: all
+          spec:
+            gatewayClassName: istio-waypoint
+            listeners:
+            - name: mesh
+              port: 15008
+              protocol: HBONE
+
+    - name: Remove namespace-wide waypoint enrollment (use per-service instead)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: patched
+        kind: Namespace
+        name: "{{ app_ns }}"
+        definition:
+          metadata:
+            labels:
+              istio.io/use-waypoint: null
+              openshift.io/user-monitoring: "true"
+
+    - name: Enroll services to use their per-service waypoint
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: patched
+        api_version: v1
+        kind: Service
+        namespace: "{{ app_ns }}"
+        name: "{{ item.name }}"
+        definition:
+          metadata:
+            labels:
+              istio.io/use-waypoint: "{{ item.waypoint }}"
+      loop:
+        - { name: reviews, waypoint: "reviews-waypoint" }
+        - { name: ratings, waypoint: "ratings-waypoint" }
+        - { name: details, waypoint: "details-waypoint" }
+
+    - name: Enroll backend workloads (deployments) to use their per-service waypoint
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: patched
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ app_ns }}"
+        name: "{{ item.name }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                labels:
+                  istio.io/use-waypoint: "{{ item.waypoint }}"
+      loop:
+        - { name: details-v1, waypoint: "details-waypoint" }
+        - { name: ratings-v1, waypoint: "ratings-waypoint" }
+        - { name: reviews-v1, waypoint: "reviews-waypoint" }
+        - { name: reviews-v2, waypoint: "reviews-waypoint" }
+        - { name: reviews-v3, waypoint: "reviews-waypoint" }
+
+    - name: Create PodMonitor for waypoints (metrics for Kiali graph)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: monitoring.coreos.com/v1
+          kind: PodMonitor
+          metadata:
+            name: istio-waypoints-monitor
+            namespace: "{{ app_ns }}"
+            labels:
+              k8s-app: waypoint-monitor
+              openshift.io/user-monitoring: "true"
+          spec:
+            selector:
+              matchExpressions:
+                - key: gateway.networking.k8s.io/gateway-name
+                  operator: In
+                  values: ["reviews-waypoint","ratings-waypoint","details-waypoint"]
+            podMetricsEndpoints:
+            - path: /stats/prometheus
+              port: http-envoy-prom
+              interval: 30s
+
+    - name: Deploy Full Bookinfo Stack
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        namespace: "{{ app_ns }}"
+        src: "{{ bookinfo_yaml | default('https://raw.githubusercontent.com/openshift-service-mesh/istio/release-1.27/samples/bookinfo/platform/kube/bookinfo.yaml') }}"
+        state: present
+
+    - name: Deploy Bookinfo versioned workloads (v1/v2/v3)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        namespace: "{{ app_ns }}"
+        src: "{{ bookinfo_versions_yaml | default('https://raw.githubusercontent.com/openshift-service-mesh/istio/release-1.27/samples/bookinfo/platform/kube/bookinfo-versions.yaml') }}"
+        state: present
+
+    - name: Label Bookinfo services as global (istio.io/global=true)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: patched
+        api_version: v1
+        kind: Service
+        namespace: "{{ app_ns }}"
+        name: "{{ item }}"
+        definition:
+          metadata:
+            labels:
+              istio.io/global: "true"
+      loop:
+        - productpage
+        - details
+        - reviews
+        - ratings
+
+    - name: Ensure backends are enrolled in ambient on WEST (remove disabling template flags)
+      when: inventory_hostname == 'west'
+      shell: |
+        set -e
+        for d in ratings-v1 reviews-v1 reviews-v2 reviews-v3; do
+          oc --context {{ k8s_context }} -n {{ app_ns }} patch deploy/$d --type='json' -p='[
+            {"op":"remove","path":"/spec/template/metadata/annotations/ambient.istio.io~1redirection"},
+            {"op":"remove","path":"/spec/template/metadata/labels/istio.io~1dataplane-mode"}
+          ]' || true
+          oc --context {{ k8s_context }} -n {{ app_ns }} rollout restart deploy/$d || true
+        done
+
+    - name: Wait for backends rollout on WEST
+      when: inventory_hostname == 'west'
+      shell: |
+        set -e
+        oc --context {{ k8s_context }} -n {{ app_ns }} rollout status deploy/reviews-v1 --timeout=180s
+        oc --context {{ k8s_context }} -n {{ app_ns }} rollout status deploy/ratings-v1 --timeout=180s
+
+    - name: Configure Ingress Gateway (Bookinfo) on cluster
+      block:
+        - name: Create Gateway
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            definition:
+              apiVersion: gateway.networking.k8s.io/v1
+              kind: Gateway
+              metadata:
+                name: bookinfo-gateway
+                namespace: "{{ app_ns }}"
+                annotations:
+                  networking.istio.io/service-type: ClusterIP
+              spec:
+                gatewayClassName: istio
+                listeners:
+                - name: http
+                  port: 80
+                  protocol: HTTP
+                  allowedRoutes:
+                    namespaces:
+                      from: Same
+
+        - name: Create HTTPRoute
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            definition:
+              apiVersion: gateway.networking.k8s.io/v1
+              kind: HTTPRoute
+              metadata:
+                name: bookinfo
+                namespace: "{{ app_ns }}"
+              spec:
+                parentRefs:
+                - name: bookinfo-gateway
+                rules:
+                - matches:
+                  - path: { type: PathPrefix, value: /productpage }
+                  - path: { type: PathPrefix, value: /static }
+                  - path: { type: PathPrefix, value: /login }
+                  - path: { type: PathPrefix, value: /logout }
+                  - path: { type: PathPrefix, value: /api/v1/products }
+                  backendRefs:
+                  - name: productpage
+                    port: 9080
+                - matches:
+                  - path: { type: PathPrefix, value: /details }
+                  backendRefs:
+                  - name: details
+                    port: 9080
+                - matches:
+                  - path: { type: PathPrefix, value: /reviews }
+                  backendRefs:
+                  - name: reviews
+                    port: 9080
+                - matches:
+                  - path: { type: PathPrefix, value: /ratings }
+                  backendRefs:
+                  - name: ratings
+                    port: 9080
+
+        - name: Get OpenShift Ingress Domain
+          kubernetes.core.k8s_info:
+            context: "{{ k8s_context }}"
+            api_version: config.openshift.io/v1
+            kind: Ingress
+            name: cluster
+          register: ingress_config
+
+        - name: Create OpenShift Route
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            definition:
+              apiVersion: route.openshift.io/v1
+              kind: Route
+              metadata:
+                name: bookinfo-gateway
+                namespace: "{{ app_ns }}"
+              spec:
+                host: "bookinfo.{{ ingress_config.resources[0].spec.domain }}"
+                to:
+                  kind: Service
+                  name: "bookinfo-gateway-istio"
+                  weight: 100
+                port:
+                  targetPort: 80
+                wildcardPolicy: None
+
+        - name: Display Route URL
+          debug:
+            msg: "Bookinfo is available at: http://bookinfo.{{ ingress_config.resources[0].spec.domain }}/productpage"

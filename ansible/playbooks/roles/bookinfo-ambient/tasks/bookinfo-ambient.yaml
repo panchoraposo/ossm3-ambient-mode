@@ -64,7 +64,7 @@
   delay: 5
 
 # ==============================================================================
-# 3. PREPARACIÓN DEL NAMESPACE BOOKINFO
+# 3. BOOKINFO NAMESPACE PREP
 # ==============================================================================
 - name: Create 'bookinfo' Namespace with Ambient Labels
   kubernetes.core.k8s:
@@ -79,7 +79,59 @@
           istio.io/dataplane-mode: ambient
 
 # ==============================================================================
-# 4. DESPLIEGUE DE APLICACIÓN
+# 3b. WAYPOINT PROXY (L7 - metrics and traces in Kiali)
+# ==============================================================================
+- name: Deploy Waypoint Gateway for bookinfo
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: waypoint
+        namespace: "{{ app_ns }}"
+        labels:
+          istio.io/waypoint-for: service
+      spec:
+        gatewayClassName: istio-waypoint
+        listeners:
+        - name: mesh
+          port: 15008
+          protocol: HBONE
+
+- name: Enroll bookinfo namespace to use waypoint
+  kubernetes.core.k8s:
+    state: patched
+    kind: Namespace
+    name: "{{ app_ns }}"
+    definition:
+      metadata:
+        labels:
+          istio.io/use-waypoint: waypoint
+
+- name: Create PodMonitor for waypoint (metrics for Kiali graph)
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: monitoring.coreos.com/v1
+      kind: PodMonitor
+      metadata:
+        name: istio-waypoint-monitor
+        namespace: "{{ app_ns }}"
+        labels:
+          k8s-app: waypoint-monitor
+          openshift.io/user-monitoring: "true"
+      spec:
+        selector:
+          matchLabels:
+            gateway.networking.k8s.io/gateway-name: waypoint
+        podMetricsEndpoints:
+        - path: /stats/prometheus
+          portNumber: 15020
+          interval: 30s
+
+# ==============================================================================
+# 4. APPLICATION DEPLOYMENT
 # ==============================================================================
 - name: Deploy Bookinfo Base
   kubernetes.core.k8s:
@@ -94,7 +146,7 @@
     src: "{{ bookinfo_versions_yaml }}"
 
 # ==============================================================================
-# 5. ENROLLMENT (REINICIO DE PODS)
+# 5. ENROLLMENT (RESTART PODS)
 # ==============================================================================
 - name: Ensure Pods pick up Ambient Mesh (Force Restart)
   kubernetes.core.k8s:
@@ -116,7 +168,7 @@
   delay: 5
 
 # ==============================================================================
-# 6. Gateway + Route
+# 6. GATEWAY + ROUTE
 # ==============================================================================
 - name: Create Gateway
   kubernetes.core.k8s:

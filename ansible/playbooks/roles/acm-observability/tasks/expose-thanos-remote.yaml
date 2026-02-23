@@ -1,0 +1,34 @@
+---
+- name: Set default clusters list for Thanos discovery
+  set_fact:
+    thanos_clusters: "{{ thanos_clusters | default(groups['clusters']) }}"
+
+- name: Discover Thanos Querier route host (per cluster)
+  shell: |
+    set -e
+    oc --context {{ hostvars[item].k8s_context }} -n openshift-monitoring get route thanos-querier -o jsonpath='{.spec.host}'
+  loop: "{{ thanos_clusters }}"
+  register: thanos_route_hosts_cmd
+  changed_when: false
+
+- name: Build Thanos route host map
+  set_fact:
+    thanos_route_host_by_cluster: "{{ thanos_route_host_by_cluster | default({}) | combine({ item.item: item.stdout }) }}"
+  loop: "{{ thanos_route_hosts_cmd.results }}"
+
+- name: Resolve Thanos route host to IP (per cluster)
+  shell: |
+    set -e
+    python3 - <<'PY'
+    import socket
+    print(socket.gethostbyname("{{ thanos_route_host_by_cluster[item] }}"))
+    PY
+  loop: "{{ thanos_clusters }}"
+  register: thanos_route_ips_cmd
+  changed_when: false
+
+- name: Build Thanos route IP map
+  set_fact:
+    thanos_route_ip_by_cluster: "{{ thanos_route_ip_by_cluster | default({}) | combine({ item.item: item.stdout }) }}"
+  loop: "{{ thanos_route_ips_cmd.results }}"
+
