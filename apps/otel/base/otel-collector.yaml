@@ -30,6 +30,8 @@ data:
       otlp/tempo:
         endpoint: "tempo-tempo-distributor.istio-system.svc.cluster.local:4317"
         tls:
+          # In this PoC we run TempoStack with plain OTLP/gRPC on-cluster.
+          # (If you later enable mTLS on the Tempo distributor, switch this back to TLS.)
           insecure: true
       debug:
         verbosity: detailed
@@ -68,16 +70,36 @@ spec:
         volumeMounts:
         - name: otel-config
           mountPath: /etc/otelcol
+        - name: otel-mtls
+          mountPath: /etc/otelcol/mtls
+          readOnly: true
+        - name: otel-tempo-ca
+          mountPath: /etc/otelcol/tempo-ca
+          readOnly: true
       volumes:
       - name: otel-config
         configMap:
           name: otel-collector-manual
+      - name: otel-mtls
+        secret:
+          secretName: otel-collector-mtls
+          optional: true
+      - name: otel-tempo-ca
+        configMap:
+          name: openshift-service-ca.crt
+          optional: true
+          items:
+          - key: service-ca.crt
+            path: service-ca.crt
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: otel-collector
   namespace: istio-system
+  annotations:
+    # Crear secret `otel-collector-mtls` con tls.crt/tls.key (service-ca signer).
+    service.beta.openshift.io/serving-cert-secret-name: otel-collector-mtls
 spec:
   selector:
     app: otel-collector

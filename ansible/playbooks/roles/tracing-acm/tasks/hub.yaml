@@ -143,13 +143,127 @@
     state: present
     src: "{{ tempostack_manifest }}"
 
-- name: Apply OTEL collector manifest (Tempo exporter in ACM)
+- name: Install Red Hat build of OpenTelemetry Operator (OLM)
   vars:
-    otel_collector_manifest: "{{ role_path }}/../../../..//apps/otel/base/otel-collector.yaml"
+    otel_operator_ns_manifest: "{{ role_path }}/../../../..//apps/otel-operator/base/namespace.yaml"
+    otel_operator_og_manifest: "{{ role_path }}/../../../..//apps/otel-operator/base/operatorgroup.yaml"
+    otel_operator_sub_manifest: "{{ role_path }}/../../../..//apps/otel-operator/base/subscription.yaml"
   kubernetes.core.k8s:
     context: "{{ k8s_context }}"
     state: present
-    src: "{{ otel_collector_manifest }}"
+    src: "{{ item }}"
+  loop:
+    - "{{ otel_operator_ns_manifest }}"
+    - "{{ otel_operator_og_manifest }}"
+    - "{{ otel_operator_sub_manifest }}"
+
+- name: Wait for OpenTelemetry Operator CSV to be Succeeded
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: observability
+  register: otel_csv
+  until: >-
+    (
+      otel_csv.resources | default([]) |
+      selectattr('metadata', 'defined') |
+      selectattr('metadata.name', 'defined') |
+      selectattr('metadata.name', 'search', 'opentelemetry') |
+      selectattr('status', 'defined') |
+      selectattr('status.phase', 'defined') |
+      selectattr('status.phase', 'equalto', 'Succeeded') |
+      list | length
+    ) > 0
+  retries: 60
+  delay: 10
+  changed_when: false
+
+- name: Wait for OpenTelemetryCollector CRD to exist
+  shell: |
+    set -e
+    oc --context {{ k8s_context }} get crd opentelemetrycollectors.opentelemetry.io >/dev/null
+  register: otel_crd_check
+  retries: 60
+  delay: 10
+  until: otel_crd_check.rc == 0
+  changed_when: false
+
+- name: Remove legacy manual OTEL collector resources (if present)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ istio_ns }}"
+  loop:
+    - { api_version: v1, kind: ConfigMap, name: otel-collector-manual }
+    - { api_version: v1, kind: Service, name: otel-collector }
+    - { api_version: apps/v1, kind: Deployment, name: otel-collector }
+  ignore_errors: true
+
+- name: Deploy OTEL collector (OpenTelemetryCollector CR) in ACM
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: opentelemetry.io/v1beta1
+      kind: OpenTelemetryCollector
+      metadata:
+        name: otel
+        namespace: "{{ istio_ns }}"
+      spec:
+        mode: deployment
+        image: "{{ otel_image | default('registry.redhat.io/rhosdt/opentelemetry-collector-rhel8:latest') }}"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        observability:
+          metrics:
+            enableMetrics: true
+        config:
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                  endpoint: "0.0.0.0:4317"
+                http:
+                  endpoint: "0.0.0.0:4318"
+            jaeger:
+              protocols:
+                grpc:
+                  endpoint: "0.0.0.0:14250"
+                thrift_http:
+                  endpoint: "0.0.0.0:14268"
+                thrift_compact:
+                  endpoint: "0.0.0.0:6831"
+          processors:
+            batch:
+              send_batch_size: 1024
+              timeout: 200ms
+          exporters:
+            otlp/tempo:
+              endpoint: "tempo-tempo-distributor.istio-system.svc.cluster.local:4317"
+              tls:
+                insecure: true
+            debug:
+              verbosity: detailed
+          service:
+            pipelines:
+              traces:
+                receivers:
+                  - otlp
+                  - jaeger
+                processors:
+                  - batch
+                exporters:
+                  - otlp/tempo
+                  - debug
 
 - name: Expose OTLP/HTTP ingest Route on ACM (otel-collector:4318)
   kubernetes.core.k8s:
@@ -168,7 +282,7 @@
           name: otel-collector
           weight: 100
         port:
-          targetPort: http-otlp
+          targetPort: otlp-http
         wildcardPolicy: None
 
 - name: Expose Tempo query HTTP Route on ACM (optional)

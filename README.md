@@ -10,18 +10,18 @@ It also installs a **central observability hub** on an ACM cluster (`acm`) so yo
 ## What gets installed
 
 - **Data clusters (`east`, `west`)**
-  - OpenShift GitOps (operator + `ArgoCD/openshift-gitops`, with controller resources patched)
   - OSSM 3 (Sail operator) — Ambient profile
   - Multi-primary, multi-network configuration (east-west HBONE gateways + `meshNetworks`)
   - `bookinfo` namespace enrolled in ambient
   - **Per-service waypoints** for `reviews`, `ratings`, `details` (L7 telemetry + traces)
   - Bookinfo app + versioned workloads (`reviews-v1/v2/v3`, etc.)
+  - Red Hat **Cluster Observability Operator** (installed in `openshift-cluster-observability-operator`)
   - Connectivity Link components in `kuadrant-system` and a `Kuadrant` CR applied from [`kuadrant.yaml`](https://raw.githubusercontent.com/maximilianoPizarro/nfl-wallet-gitops/main/kuadrant.yaml)
 
 - **Hub cluster (`acm`)**
   - OpenShift GitOps (operator + `ArgoCD/openshift-gitops`, with controller resources patched)
   - TempoStack (Tempo) for centralized tracing
-  - OTEL collector ingress (OTLP/HTTP) for trace ingestion from data clusters
+  - Red Hat build of OpenTelemetry Operator + `OpenTelemetryCollector` (OTLP/HTTP ingest) for trace ingestion from data clusters
   - promxy as a single Prometheus-compatible API for Kiali (fan-out to both clusters)
   - A single **Kiali multi-cluster** instance (reads `east` + `west`)
 
@@ -87,7 +87,7 @@ High-level phases:
 2. Install OSSM 3 Ambient on `east` and `west`
 3. Exchange remote secrets (peering)
 4. Configure multi-network (east-west gateway + `meshNetworks`)
-5. Install GitOps + Connectivity Link + Kuadrant on `east` and `west`
+5. Install Cluster Observability Operator + Connectivity Link + Kuadrant on `east` and `west`
 6. Install GitOps on `acm`
 7. Deploy Bookinfo + per-service waypoints
 8. Install centralized tracing on `acm` and configure exporters on `east`/`west`
@@ -97,6 +97,12 @@ High-level phases:
 
 ```bash
 ./generate-traffic.sh
+```
+
+For a more "demo-friendly" traffic pattern (concurrency + mixed endpoints + bursts):
+
+```bash
+./generate-traffic-realistic.sh --workers 20 --interval 1
 ```
 
 ## Viewing the demo

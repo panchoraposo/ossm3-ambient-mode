@@ -11,19 +11,44 @@
           labels:
             openshift.io/cluster-monitoring: "true"
   
-  - name: "Get real Root CA from Istio Secret"
+  - name: "Read mesh root CA from Istio secrets (istio-ca-secret or cacerts)"
     kubernetes.core.k8s_info:
       context: "{{ k8s_context | default(omit) }}"
       api_version: v1
       kind: Secret
-      name: istio-ca-secret
+      name: "{{ item }}"
       namespace: istio-system
-    register: istio_secret_ca
-    until: istio_secret_ca.resources | length > 0
-    retries: 60
+    loop:
+      - istio-ca-secret
+      - cacerts
+    register: istio_ca_secrets
+    changed_when: false
+    failed_when: false
+    retries: 30
     delay: 5
   
-  - name: "Force creation of 'istio-ca-root-cert' in kuadrant-system"
+  - name: "Set mesh root CA content (PEM)"
+    ansible.builtin.set_fact:
+      mesh_root_cert_pem: >-
+        {%- set sec = (istio_ca_secrets.results | map(attribute='resources') | select('defined') | list) -%}
+        {%- set istio_ca = (istio_ca_secrets.results | selectattr('item','equalto','istio-ca-secret') | map(attribute='resources') | first | default([])) -%}
+        {%- set cacerts = (istio_ca_secrets.results | selectattr('item','equalto','cacerts') | map(attribute='resources') | first | default([])) -%}
+        {%- if istio_ca | length > 0 and (istio_ca[0].data['ca-cert.pem'] is defined) -%}
+        {{ istio_ca[0].data['ca-cert.pem'] | b64decode }}
+        {%- elif cacerts | length > 0 and (cacerts[0].data['root-cert.pem'] is defined) -%}
+        {{ cacerts[0].data['root-cert.pem'] | b64decode }}
+        {%- else -%}
+        {{ '' }}
+        {%- endif -%}
+
+  - name: "Fail if mesh root CA could not be found"
+    ansible.builtin.fail:
+      msg: >-
+        Could not find a mesh root CA in istio-system. Expected Secret/istio-ca-secret (data.ca-cert.pem)
+        or Secret/cacerts (data.root-cert.pem). Ensure Phase 1 (shared CA) and Istio installation completed.
+    when: mesh_root_cert_pem | length == 0
+
+  - name: "Create 'istio-ca-root-cert' ConfigMap in kuadrant-system"
     kubernetes.core.k8s:
       context: "{{ k8s_context | default(omit) }}"
       state: present
@@ -36,33 +61,38 @@
           labels:
             istio.io/config: "true"
         data:
-          root-cert.pem: "{{ istio_secret_ca.resources[0].data['ca-cert.pem'] | b64decode }}"
-    when: istio_secret_ca.resources | length > 0
+          root-cert.pem: "{{ mesh_root_cert_pem }}"
   
-  - name: "Create ArgoApp for Connectivity Link Operator"
+  - name: "Install Connectivity Link operator (OperatorGroup + Subscription)"
     kubernetes.core.k8s:
       context: "{{ k8s_context | default(omit) }}"
       state: present
-      definition:
-        apiVersion: argoproj.io/v1alpha1
-        kind: Application
-        metadata:
-          name: rhcl-operator
-          namespace: openshift-gitops
-        spec:
-          project: default
-          source: 
-            repoURL: "{{ gitops_repo }}"
-            targetRevision: main 
-            path: apps/connectivity-link-operator/overlays/dev 
-          destination: 
-            server: https://kubernetes.default.svc
-          syncPolicy: 
-            automated: 
-              prune: true
-              selfHeal: true
-            syncOptions: 
-              - CreateNamespace=true
+      src: "{{ item }}"
+    loop:
+      - "{{ role_path }}/../../../../apps/connectivity-link-operator/base/operator-group.yaml"
+      - "{{ role_path }}/../../../../apps/connectivity-link-operator/base/subscription.yaml"
+
+  - name: "Wait for Connectivity Link operator CSV to be Succeeded"
+    kubernetes.core.k8s_info:
+      context: "{{ k8s_context | default(omit) }}"
+      api_version: operators.coreos.com/v1alpha1
+      kind: ClusterServiceVersion
+      namespace: kuadrant-system
+    register: rhcl_csvs
+    until: >-
+      (
+        rhcl_csvs.resources | default([]) |
+        selectattr('metadata', 'defined') |
+        selectattr('metadata.name', 'defined') |
+        selectattr('metadata.name', 'search', 'rhcl-operator') |
+        selectattr('status', 'defined') |
+        selectattr('status.phase', 'defined') |
+        selectattr('status.phase', 'equalto', 'Succeeded') |
+        list | length
+      ) > 0
+    retries: 60
+    delay: 10
+    changed_when: false
   
   - name: "Approve pending InstallPlans"
     ansible.builtin.shell: |
@@ -129,8 +159,8 @@
 
   - name: "Apply Kuadrant CR (Authorino + Limitador) in kuadrant-system"
     vars:
-      kuadrant_yaml_url: "{{ kuadrant_yaml_url | default('https://raw.githubusercontent.com/maximilianoPizarro/nfl-wallet-gitops/main/kuadrant.yaml') }}"
+      kuadrant_yaml_url_effective: "{{ kuadrant_yaml_url | default('https://raw.githubusercontent.com/maximilianoPizarro/nfl-wallet-gitops/main/kuadrant.yaml') }}"
     ansible.builtin.shell: |
       set -e
-      oc{{ (' --context ' ~ k8s_context) if (k8s_context is defined) else '' }} apply -n kuadrant-system -f {{ kuadrant_yaml_url }}
+      oc{{ (' --context ' ~ k8s_context) if (k8s_context is defined) else '' }} apply -n kuadrant-system -f {{ kuadrant_yaml_url_effective }}
     changed_when: true

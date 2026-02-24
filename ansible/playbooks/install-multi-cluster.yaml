@@ -1,4 +1,27 @@
 ---
+- name: Phase 0 - Ensure local Python dependencies for Ansible modules
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    deps:
+      - kubernetes
+      - openshift
+      - PyYAML
+      - jmespath
+  tasks:
+    - name: Install required Python packages (best effort)
+      ansible.builtin.command: >-
+        {{ ansible_playbook_python }} -m pip install -q {{ deps | join(' ') }}
+      register: pip_install
+      changed_when: pip_install.rc == 0
+      failed_when: false
+
+    - name: Install required Python packages (allow system site-packages)
+      when: pip_install.rc != 0
+      ansible.builtin.command: >-
+        {{ ansible_playbook_python }} -m pip install -q --break-system-packages {{ deps | join(' ') }}
+
 - name: Phase 1 - Generate and distribute certificates
   import_playbook: roles/multi-cluster/tasks/trust.yaml
 
@@ -11,13 +34,13 @@
 - name: Phase 3.5 - Configure multi-network (meshNetworks + eastwest gateway)
   import_playbook: roles/multi-cluster/tasks/mesh-networks.yaml
 
-- name: Phase 4 - Install GitOps + Connectivity Link + Kuadrant on data clusters
+- name: Phase 4 - Install Connectivity Link + Kuadrant on data clusters
   hosts: clusters
   gather_facts: false
   vars_files:
     - ../vars/demo.yaml
   roles:
-    - role: gitops-config
+    - role: cluster-observability
     - role: connectivity-link
 
 - name: Phase 4.5 - Install GitOps on hub cluster (acm)
@@ -43,7 +66,6 @@
         name: tracing-acm
         tasks_from: discover.yaml
       vars:
-        ctx_acm: "{{ ctx_acm }}"
         istio_ns: "istio-system"
 
     - name: Set Tempo query URL for Kiali (Jaeger Query API)

@@ -6,15 +6,48 @@ metadata:
 spec:
   managementState: Managed
   replicationFactor: 1
+  timeout: 2m
   retention:
     global: 
       traces: "48h"
   template:
     queryFrontend:
+      component:
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
       jaegerQuery:
         enabled: true
+        findTracesConcurrentRequests: 2
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
         ingress:
           type: route
+        tempoQuery:
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+    querier:
+      resources:
+        requests:
+          cpu: 200m
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
   storage:
     secret:
       name: tempo-demo-s3

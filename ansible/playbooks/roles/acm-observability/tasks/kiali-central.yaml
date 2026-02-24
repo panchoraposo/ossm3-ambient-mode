@@ -108,7 +108,7 @@
             provider: jaeger
             internal_url: "{{ tempo_query_http_url }}"
             use_grpc: false
-            query_timeout: 20
+            query_timeout: 120
           grafana:
             enabled: false
         kubernetes_config:

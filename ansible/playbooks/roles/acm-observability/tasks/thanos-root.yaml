@@ -17,10 +17,37 @@
   set_fact:
     promxy_clusters: "{{ promxy_clusters | default(groups['clusters']) }}"
 
+- name: Set defaults for promxy upstream auth
+  set_fact:
+    metrics_reader_sa: "{{ metrics_reader_sa | default('acm-thanos-reader') }}"
+
+- name: Read metrics reader tokens from data clusters (for promxy)
+  ansible.builtin.shell: |
+    set -e
+    python3 - <<'PY'
+    import base64, subprocess
+
+    ctx = "{{ hostvars[item].k8s_context | default(item) }}"
+    ns = "{{ istio_ns }}"
+    secret = "{{ metrics_reader_sa }}-token"
+
+    b64 = subprocess.check_output(
+      ["oc", "--context", ctx, "-n", ns, "get", "secret", secret, "-o", "jsonpath={.data.token}"]
+    ).decode("utf-8")
+
+    if not b64.strip():
+        raise SystemExit(f"Empty token in secret {ns}/{secret} (context {ctx})")
+
+    print(base64.b64decode(b64).decode("utf-8"))
+    PY
+  register: promxy_metrics_reader_tokens
+  changed_when: false
+  loop: "{{ promxy_clusters }}"
+
 - name: Build promxy upstream tokens secret stringData
   set_fact:
-    promxy_upstream_tokens_stringData: "{{ promxy_upstream_tokens_stringData | default({}) | combine({ (item ~ '.token'): hostvars[item].metrics_reader_token_value }) }}"
-  loop: "{{ promxy_clusters }}"
+    promxy_upstream_tokens_stringData: "{{ promxy_upstream_tokens_stringData | default({}) | combine({ (item.item ~ '.token'): item.stdout }) }}"
+  loop: "{{ promxy_metrics_reader_tokens.results }}"
 
 - name: Build promxy hostAliases (pin Thanos route hosts to IPs)
   set_fact:

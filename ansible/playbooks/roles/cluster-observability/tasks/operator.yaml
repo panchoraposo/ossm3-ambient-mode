@@ -1,0 +1,158 @@
+---
+# Installs the Red Hat Cluster Observability Operator (COO) via OLM.
+#
+# Default install settings (per Red Hat docs):
+# - channel: stable
+# - install mode: all namespaces
+# - installed namespace: openshift-cluster-observability-operator
+#
+# Variables:
+# - k8s_context (required in multi-cluster runs)
+# - coo_namespace (default: openshift-cluster-observability-operator)
+# - coo_channel (default: stable)
+# - coo_catalog_source (default: redhat-operators)
+# - coo_catalog_source_ns (default: openshift-marketplace)
+# - coo_package_name (optional override; default: cluster-observability-operator)
+
+- name: Set defaults
+  ansible.builtin.set_fact:
+    coo_namespace: "{{ coo_namespace | default('openshift-cluster-observability-operator') }}"
+    coo_channel: "{{ coo_channel | default('stable') }}"
+    coo_catalog_source: "{{ coo_catalog_source | default('redhat-operators') }}"
+    coo_catalog_source_ns: "{{ coo_catalog_source_ns | default('openshift-marketplace') }}"
+    coo_package_name: "{{ coo_package_name | default('cluster-observability-operator') }}"
+
+- name: Ensure COO namespace exists (with cluster monitoring enabled)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ coo_namespace }}"
+        labels:
+          openshift.io/cluster-monitoring: "true"
+
+- name: Get existing OperatorGroups in COO namespace
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    namespace: "{{ coo_namespace }}"
+  register: coo_operatorgroups
+  changed_when: false
+
+- name: Determine OperatorGroup state
+  ansible.builtin.set_fact:
+    _coo_ogs: "{{ coo_operatorgroups.resources | default([]) }}"
+    _coo_managed_og_name: "cluster-observability-operator-group"
+    _coo_managed_og_present: >-
+      {{
+        (coo_operatorgroups.resources | default([]) |
+         selectattr('metadata.name', 'equalto', 'cluster-observability-operator-group') |
+         list | length) > 0
+      }}
+
+- name: Fail if multiple OperatorGroups exist but managed one is missing
+  when:
+    - _coo_ogs | length > 1
+    - not _coo_managed_og_present
+  ansible.builtin.fail:
+    msg: >-
+      Multiple OperatorGroups exist in namespace '{{ coo_namespace }}' but the managed
+      OperatorGroup '{{ _coo_managed_og_name }}' is not present. OLM cannot select an
+      OperatorGroup automatically and the operator installation will fail.
+      Delete extra OperatorGroups so only one remains, or re-run after cleaning the namespace.
+
+- name: Remove extra OperatorGroups (keep the managed one)
+  when:
+    - _coo_ogs | length > 1
+    - _coo_managed_og_present
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    namespace: "{{ coo_namespace }}"
+    name: "{{ item }}"
+  loop: >-
+    {{
+      _coo_ogs |
+      map(attribute='metadata.name') |
+      reject('equalto', _coo_managed_og_name) |
+      list
+    }}
+
+- name: Ensure managed OperatorGroup exists for COO
+  when: _coo_ogs | length == 0
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: cluster-observability-operator-group
+        namespace: "{{ coo_namespace }}"
+      spec:
+        targetNamespaces: []
+
+- name: Verify COO PackageManifest exists
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: packages.operators.coreos.com/v1
+    kind: PackageManifest
+    name: "{{ coo_package_name }}"
+    namespace: "{{ coo_catalog_source_ns }}"
+  register: coo_pm
+  failed_when: false
+  changed_when: false
+
+- name: Fail if COO PackageManifest is missing
+  when: coo_pm.resources | default([]) | length == 0
+  ansible.builtin.fail:
+    msg: >-
+      PackageManifest '{{ coo_package_name }}' was not found in namespace '{{ coo_catalog_source_ns }}'.
+      Ensure the Red Hat Operator catalog source '{{ coo_catalog_source }}' is available.
+      If your package name differs, set `coo_package_name` explicitly.
+
+- name: Create Subscription for Cluster Observability Operator
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: cluster-observability-operator
+        namespace: "{{ coo_namespace }}"
+      spec:
+        channel: "{{ coo_channel }}"
+        installPlanApproval: Automatic
+        name: "{{ coo_package_name }}"
+        source: "{{ coo_catalog_source }}"
+        sourceNamespace: "{{ coo_catalog_source_ns }}"
+
+- name: Wait for COO CSV to be Succeeded
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ coo_namespace }}"
+  register: coo_csvs
+  until: >-
+    (
+      coo_csvs.resources | default([]) |
+      selectattr('metadata', 'defined') |
+      selectattr('metadata.name', 'defined') |
+      selectattr('metadata.name', 'search', 'cluster-observability') |
+      selectattr('status', 'defined') |
+      selectattr('status.phase', 'defined') |
+      selectattr('status.phase', 'equalto', 'Succeeded') |
+      list | length
+    ) > 0
+  retries: 60
+  delay: 10
+  changed_when: false
+

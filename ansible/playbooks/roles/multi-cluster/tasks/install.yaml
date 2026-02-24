@@ -48,10 +48,16 @@
         namespace: "{{ operator_namespace }}"
       register: csv_list
       until: >-
-        csv_list.resources 
-        | selectattr('spec.displayName', 'search', 'Service Mesh') 
-        | selectattr('status.phase', 'equalto', 'Succeeded') 
-        | list | length > 0
+        (
+          csv_list.resources | default([]) |
+          selectattr('spec', 'defined') |
+          selectattr('spec.displayName', 'defined') |
+          selectattr('spec.displayName', 'search', 'Service Mesh') |
+          selectattr('status', 'defined') |
+          selectattr('status.phase', 'defined') |
+          selectattr('status.phase', 'equalto', 'Succeeded') |
+          list | length
+        ) > 0
       retries: 60
       delay: 10
       ignore_errors: yes

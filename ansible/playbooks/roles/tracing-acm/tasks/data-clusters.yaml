@@ -1,18 +1,88 @@
 ---
-- name: Create otel-collector ConfigMap (export to ACM via OTLP/HTTP)
+- name: Install Red Hat build of OpenTelemetry Operator (OLM)
+  vars:
+    otel_operator_ns_manifest: "{{ role_path }}/../../../..//apps/otel-operator/base/namespace.yaml"
+    otel_operator_og_manifest: "{{ role_path }}/../../../..//apps/otel-operator/base/operatorgroup.yaml"
+    otel_operator_sub_manifest: "{{ role_path }}/../../../..//apps/otel-operator/base/subscription.yaml"
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    src: "{{ item }}"
+  loop:
+    - "{{ otel_operator_ns_manifest }}"
+    - "{{ otel_operator_og_manifest }}"
+    - "{{ otel_operator_sub_manifest }}"
+
+- name: Wait for OpenTelemetry Operator CSV to be Succeeded
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: observability
+  register: otel_csv
+  until: >-
+    (
+      otel_csv.resources | default([]) |
+      selectattr('metadata', 'defined') |
+      selectattr('metadata.name', 'defined') |
+      selectattr('metadata.name', 'search', 'opentelemetry') |
+      selectattr('status', 'defined') |
+      selectattr('status.phase', 'defined') |
+      selectattr('status.phase', 'equalto', 'Succeeded') |
+      list | length
+    ) > 0
+  retries: 60
+  delay: 10
+  changed_when: false
+
+- name: Wait for OpenTelemetryCollector CRD to exist
+  shell: |
+    set -e
+    oc --context {{ k8s_context }} get crd opentelemetrycollectors.opentelemetry.io >/dev/null
+  register: otel_crd_check
+  retries: 60
+  delay: 10
+  until: otel_crd_check.rc == 0
+  changed_when: false
+
+- name: Remove legacy manual OTEL collector resources (if present)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    name: "{{ item.name }}"
+    namespace: "{{ istio_ns }}"
+  loop:
+    - { api_version: v1, kind: ConfigMap, name: otel-collector-manual }
+    - { api_version: v1, kind: Service, name: otel-collector }
+    - { api_version: apps/v1, kind: Deployment, name: otel-collector }
+  ignore_errors: true
+
+- name: Deploy OTEL collector (OpenTelemetryCollector CR) on data cluster (export to ACM)
   kubernetes.core.k8s:
     context: "{{ k8s_context }}"
     state: present
     definition:
-      apiVersion: v1
-      kind: ConfigMap
+      apiVersion: opentelemetry.io/v1beta1
+      kind: OpenTelemetryCollector
       metadata:
-        name: otel-collector-manual
+        name: otel
         namespace: "{{ istio_ns }}"
-        labels:
-          app: otel-collector
-      data:
-        config.yaml: |
+      spec:
+        mode: deployment
+        image: "{{ otel_image | default('registry.redhat.io/rhosdt/opentelemetry-collector-rhel8:latest') }}"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        observability:
+          metrics:
+            enableMetrics: true
+        config:
           receivers:
             otlp:
               protocols:
@@ -40,73 +110,12 @@
           service:
             pipelines:
               traces:
-                receivers: [otlp, jaeger]
-                processors: [batch]
-                exporters: [otlphttp/acm, debug]
-
-- name: Ensure otel-collector Service exists
-  kubernetes.core.k8s:
-    context: "{{ k8s_context }}"
-    state: present
-    definition:
-      apiVersion: v1
-      kind: Service
-      metadata:
-        name: otel-collector
-        namespace: "{{ istio_ns }}"
-        annotations:
-          service.beta.openshift.io/serving-cert-secret-name: otel-collector-mtls
-      spec:
-        selector:
-          app: otel-collector
-        ports:
-        - name: grpc-otlp
-          port: 4317
-          targetPort: 4317
-          protocol: TCP
-        - name: http-otlp
-          port: 4318
-          targetPort: 4318
-          protocol: TCP
-
-- name: Ensure otel-collector Deployment exists
-  kubernetes.core.k8s:
-    context: "{{ k8s_context }}"
-    state: present
-    definition:
-      apiVersion: apps/v1
-      kind: Deployment
-      metadata:
-        name: otel-collector
-        namespace: "{{ istio_ns }}"
-        labels:
-          app: otel-collector
-      spec:
-        replicas: 1
-        selector:
-          matchLabels:
-            app: otel-collector
-        template:
-          metadata:
-            labels:
-              app: otel-collector
-          spec:
-            containers:
-            - name: otel-collector
-              image: "{{ otel_image }}"
-              args:
-                - "--config=/etc/otelcol/config.yaml"
-              ports:
-              - containerPort: 4317
-              - containerPort: 4318
-              volumeMounts:
-              - name: otel-config
-                mountPath: /etc/otelcol
-            volumes:
-            - name: otel-config
-              configMap:
-                name: otel-collector-manual
-                items:
-                - key: config.yaml
-                  path: config.yaml
+                receivers:
+                  - otlp
+                  - jaeger
+                processors:
+                  - batch
+                exporters:
+                  - otlphttp/acm
+                  - debug
 
