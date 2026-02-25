@@ -1,0 +1,203 @@
+---
+# Increase kubelet maxPods on SNO (or master pool) to avoid "Too many pods" scheduling failures.
+#
+# WARNING: This triggers a MachineConfigPool rollout and will reboot nodes in the target pool.
+#
+# Variables:
+# - k8s_context (required)
+# - sno_maxpods_enable (default: false)
+# - sno_maxpods_value (default: 500)
+# - sno_target_mcp (default: master)
+# - sno_kubeletconfig_name (default: demo-maxpods)
+# - sno_wait_retries (default: 120)
+# - sno_wait_delay (default: 30)
+
+- name: Set defaults
+  ansible.builtin.set_fact:
+    sno_maxpods_enable: "{{ sno_maxpods_enable | default(false) | bool }}"
+    sno_maxpods_value: "{{ sno_maxpods_value | default(500) | int }}"
+    sno_target_mcp: "{{ sno_target_mcp | default('master') }}"
+    sno_kubeletconfig_name: "{{ sno_kubeletconfig_name | default('demo-maxpods') }}"
+    sno_wait_retries: "{{ sno_wait_retries | default(120) | int }}"
+    sno_wait_delay: "{{ sno_wait_delay | default(30) | int }}"
+    sno_mcp_selector_label_key: "{{ 'pools.operator.machineconfiguration.openshift.io/' ~ (sno_target_mcp | default('master')) }}"
+    sno_mcp_selector_labels: "{{ { ('pools.operator.machineconfiguration.openshift.io/' ~ (sno_target_mcp | default('master'))): '' } }}"
+
+- name: Skip if maxPods tuning is disabled
+  when: not (sno_maxpods_enable | bool)
+  ansible.builtin.debug:
+    msg: "SNO kubelet maxPods tuning is disabled (set -e sno_maxpods_enable=true to enable)."
+
+- name: Read existing KubeletConfig (if any)
+  when: (sno_maxpods_enable | bool)
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: machineconfiguration.openshift.io/v1
+    kind: KubeletConfig
+    name: "{{ sno_kubeletconfig_name }}"
+  register: existing_kubeletconfig
+  failed_when: false
+  changed_when: false
+
+- name: Initialize existing KubeletConfig analysis
+  when: (sno_maxpods_enable | bool)
+  ansible.builtin.set_fact:
+    _kc_exists: "{{ (existing_kubeletconfig.resources | default([]) | length) > 0 }}"
+    _kc_selector_map: >-
+      {{
+        (
+          (existing_kubeletconfig.resources[0] | json_query('spec.machineConfigPoolSelector.matchLabels'))
+          if (existing_kubeletconfig.resources | default([]) | length) > 0
+          else {}
+        ) | default({})
+      }}
+    _kc_maxpods: >-
+      {{
+        (
+          (existing_kubeletconfig.resources[0] | json_query('spec.kubeletConfig.maxPods'))
+          if (existing_kubeletconfig.resources | default([]) | length) > 0
+          else 0
+        ) | default(0) | int
+      }}
+
+- name: Decide whether KubeletConfig must be recreated (avoid merge leftovers)
+  when: (sno_maxpods_enable | bool)
+  ansible.builtin.set_fact:
+    kubeletconfig_needs_recreate: >-
+      {{
+        _kc_exists and
+        (
+          (_kc_selector_map | length != 1) or
+          (sno_mcp_selector_label_key not in _kc_selector_map) or
+          (
+            (_kc_selector_map | dict2items | selectattr('key', 'search', '\\{\\{|\\}\\}') | list | length) > 0
+          ) or
+          (_kc_maxpods != (sno_maxpods_value | int))
+        )
+      }}
+
+- name: Delete existing KubeletConfig if it needs recreation
+  when:
+    - (sno_maxpods_enable | bool)
+    - kubeletconfig_needs_recreate
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: absent
+    api_version: machineconfiguration.openshift.io/v1
+    kind: KubeletConfig
+    name: "{{ sno_kubeletconfig_name }}"
+
+- name: Apply KubeletConfig to increase maxPods
+  when: (sno_maxpods_enable | bool)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: machineconfiguration.openshift.io/v1
+      kind: KubeletConfig
+      metadata:
+        name: "{{ sno_kubeletconfig_name }}"
+      spec:
+        machineConfigPoolSelector:
+          matchLabels: "{{ sno_mcp_selector_labels }}"
+        kubeletConfig:
+          maxPods: "{{ sno_maxpods_value | int }}"
+
+- name: Validate KubeletConfig selector is clean
+  when: (sno_maxpods_enable | bool)
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: machineconfiguration.openshift.io/v1
+    kind: KubeletConfig
+    name: "{{ sno_kubeletconfig_name }}"
+  register: kubeletconfig_readback
+  changed_when: false
+
+- name: Fail if KubeletConfig selector still contains invalid keys
+  ansible.builtin.fail:
+    msg: >-
+      KubeletConfig '{{ sno_kubeletconfig_name }}' has an invalid MachineConfigPool selector in context '{{ k8s_context }}':
+      {{ kubeletconfig_readback.resources[0].spec.machineConfigPoolSelector.matchLabels | default({}) }}.
+      Expected only: {{ sno_mcp_selector_label_key }}.
+  vars:
+    _selector_map: "{{ (kubeletconfig_readback.resources[0] | json_query('spec.machineConfigPoolSelector.matchLabels')) | default({}) }}"
+    _selector_items: "{{ _selector_map | dict2items }}"
+  when:
+    - (sno_maxpods_enable | bool)
+    - >
+      (
+        (_selector_items | selectattr('key','search','\\{\\{|\\}\\}') | list | length) > 0
+        or
+        (_selector_map | length) != 1
+        or
+        (sno_mcp_selector_label_key not in _selector_map)
+      )
+
+- name: Wait for KubeletConfig to be accepted (no Failure condition)
+  when: (sno_maxpods_enable | bool)
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: machineconfiguration.openshift.io/v1
+    kind: KubeletConfig
+    name: "{{ sno_kubeletconfig_name }}"
+  register: kubeletconfig_status
+  changed_when: false
+  until: >-
+    (
+      kubeletconfig_status.resources | default([]) | length > 0 and
+      (
+        (kubeletconfig_status.resources[0].status is not defined) or
+        (kubeletconfig_status.resources[0].status.conditions is not defined) or
+        (
+          kubeletconfig_status.resources[0].status.conditions |
+          selectattr('type', 'equalto', 'Failure') |
+          selectattr('status', 'equalto', 'True') |
+          list | length
+        ) == 0
+      )
+    )
+  retries: 20
+  delay: 6
+
+- name: Wait for node to finish applying rendered config (SNO-safe)
+  when: (sno_maxpods_enable | bool)
+  ansible.builtin.shell: |
+    set -e
+    python3 - <<'PY'
+    import json, subprocess
+    ctx = "{{ k8s_context }}"
+    node = subprocess.check_output(["oc","--context",ctx,"get","nodes","-o","jsonpath={.items[0].metadata.name}"]).decode().strip()
+    obj = json.loads(subprocess.check_output(["oc","--context",ctx,"get","node",node,"-o","json"]))
+    ann = obj.get("metadata", {}).get("annotations", {}) or {}
+    cur = ann.get("machineconfiguration.openshift.io/currentConfig", "")
+    des = ann.get("machineconfiguration.openshift.io/desiredConfig", "")
+    ready = False
+    for c in (obj.get("status", {}) or {}).get("conditions", []) or []:
+        if c.get("type") == "Ready" and c.get("status") == "True":
+            ready = True
+            break
+    alloc = ((obj.get("status", {}) or {}).get("allocatable", {}) or {}).get("pods", "")
+    print(json.dumps({"node": node, "current": cur, "desired": des, "ready": ready, "allocPods": alloc}))
+    PY
+  register: node_cfg
+  changed_when: false
+  failed_when: false
+  until: >-
+    (
+      (node_cfg.rc | int) == 0 and
+      (node_cfg.stdout | length) > 0 and
+      ((node_cfg.stdout | from_json).ready | bool) and
+      ((node_cfg.stdout | from_json).current == (node_cfg.stdout | from_json).desired)
+    )
+  retries: "{{ sno_wait_retries }}"
+  delay: "{{ sno_wait_delay }}"
+
+- name: Verify node allocatable pods increased (after rollout)
+  when: (sno_maxpods_enable | bool)
+  ansible.builtin.shell: |
+    set -e
+    oc --context {{ k8s_context }} get nodes -o jsonpath='{.items[0].status.allocatable.pods}{"\n"}'
+  register: allocatable_pods
+  changed_when: false
+  failed_when: (allocatable_pods.stdout | int) < (sno_maxpods_value | int)
+

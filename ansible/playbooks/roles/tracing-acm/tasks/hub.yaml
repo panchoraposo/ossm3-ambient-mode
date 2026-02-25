@@ -305,3 +305,23 @@
           targetPort: 3200
         wildcardPolicy: None
 
+- name: Expose Tempo Jaeger Query Route on ACM (Jaeger UI/API)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: route.openshift.io/v1
+      kind: Route
+      metadata:
+        name: tempo-jaeger-query
+        namespace: "{{ istio_ns }}"
+      spec:
+        host: "{{ hostvars['localhost'].acm_tempo_jaeger_query_http_host }}"
+        to:
+          kind: Service
+          name: tempo-tempo-query-frontend
+          weight: 100
+        port:
+          targetPort: 16686
+        wildcardPolicy: None
+

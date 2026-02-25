@@ -22,6 +22,38 @@
       ansible.builtin.command: >-
         {{ ansible_playbook_python }} -m pip install -q --break-system-packages {{ deps | join(' ') }}
 
+- name: Phase 0.5 - Scale worker MachineSets (east + west)
+  hosts: clusters
+  gather_facts: false
+  tasks:
+    - name: Scale worker MachineSets (role)
+      import_role:
+        name: machineset-scale
+
+- name: "Phase 0.55 - SNO: optionally increase kubelet maxPods (east + west)"
+  hosts: clusters
+  gather_facts: false
+  tasks:
+    - name: Increase kubelet maxPods (role)
+      import_role:
+        name: sno-kubelet-maxpods
+
+- name: "Phase 0.56 - SNO: approve kubelet-serving CSRs (east + west)"
+  hosts: clusters
+  gather_facts: false
+  tasks:
+    - name: Approve kubelet-serving CSRs (role)
+      import_role:
+        name: sno-kubelet-serving-csr-approve
+
+- name: Phase 0.6 - Preflight pod capacity (east + west)
+  hosts: clusters
+  gather_facts: false
+  tasks:
+    - name: Pod capacity preflight (role)
+      import_role:
+        name: pod-capacity-preflight
+
 - name: Phase 1 - Generate and distribute certificates
   import_playbook: roles/multi-cluster/tasks/trust.yaml
 
@@ -41,6 +73,7 @@
     - ../vars/demo.yaml
   roles:
     - role: cluster-observability
+    - role: nfl-wallet
     - role: connectivity-link
 
 - name: Phase 4.5 - Install GitOps on hub cluster (acm)
@@ -50,6 +83,15 @@
     - ../vars/demo.yaml
   roles:
     - role: gitops-config
+
+- name: Phase 4.6 - Install Grafana Operator on hub cluster (acm)
+  hosts: acm
+  gather_facts: false
+  tasks:
+    - name: Install Grafana Operator (role)
+      import_role:
+        name: grafana-operator
+        tasks_from: operator.yaml
 
 - name: Phase 5 - Deploy Bookinfo application
   import_playbook: roles/multi-cluster/tasks/apps.yaml

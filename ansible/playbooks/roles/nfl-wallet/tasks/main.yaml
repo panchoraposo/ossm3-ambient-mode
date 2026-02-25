@@ -1,0 +1,47 @@
+---
+# NFL Wallet demo helpers (data clusters).
+#
+# Current responsibilities:
+# - Create HelmChartRepository/nfl-wallet for OpenShift Helm integration.
+#
+# Variables:
+# - k8s_context (required)
+# - helm_repo_name (default: nfl-wallet)
+# - helm_repo_url (default: https://maximilianopizarro.github.io/NFL-Wallet)
+# - helm_repo_display_name (default: NFL Wallet)
+# - helm_repo_description (default: NFL Stadium Wallet - webapp Vue + APIs (customers, bills, raiders) con Gateway API)
+
+- name: Set defaults
+  ansible.builtin.set_fact:
+    helm_repo_name: "{{ helm_repo_name | default('nfl-wallet') }}"
+    helm_repo_url: "{{ helm_repo_url | default('https://maximilianopizarro.github.io/NFL-Wallet') }}"
+    helm_repo_display_name: "{{ helm_repo_display_name | default('NFL Wallet') }}"
+    helm_repo_description: "{{ helm_repo_description | default('NFL Stadium Wallet - webapp Vue + APIs (customers, bills, raiders) con Gateway API') }}"
+
+- name: Ensure HelmChartRepository CRD exists
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: helmchartrepositories.helm.openshift.io
+  register: helm_repo_crd
+  changed_when: false
+  failed_when: helm_repo_crd.resources | default([]) | length == 0
+
+- name: Create/Update HelmChartRepository
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: helm.openshift.io/v1beta1
+      kind: HelmChartRepository
+      metadata:
+        name: "{{ helm_repo_name }}"
+        annotations:
+          argocd.argoproj.io/tracking-id: "nfl-wallet-{{ inventory_hostname }}:helm.openshift.io/HelmChartRepository:/{{ helm_repo_name }}"
+      spec:
+        connectionConfig:
+          url: "{{ helm_repo_url }}"
+        description: "{{ helm_repo_description }}"
+        name: "{{ helm_repo_display_name }}"
+

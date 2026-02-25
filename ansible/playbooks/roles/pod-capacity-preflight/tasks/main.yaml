@@ -1,0 +1,65 @@
+---
+# Preflight check to avoid OLM installs hanging on SNO due to pod saturation.
+#
+# Variables:
+# - k8s_context (required)
+# - pod_capacity_min_free_slots (default: 20)
+# - pod_capacity_fail (default: true)
+
+- name: Set defaults
+  ansible.builtin.set_fact:
+    pod_capacity_min_free_slots: "{{ pod_capacity_min_free_slots | default(20) | int }}"
+    pod_capacity_fail: "{{ pod_capacity_fail | default(true) | bool }}"
+
+- name: Gather node pod capacity and usage (non-terminated pods bound to nodes)
+  ansible.builtin.shell: |
+    set -e
+    python3 - <<'PY'
+    import json, subprocess
+
+    ctx = "{{ k8s_context }}"
+    nodes = json.loads(subprocess.check_output(["oc","--context",ctx,"get","nodes","-o","json"]))
+    pods = json.loads(subprocess.check_output(["oc","--context",ctx,"get","pods","-A","-o","json"]))
+
+    alloc = 0
+    for n in nodes.get("items", []):
+      a = n.get("status", {}).get("allocatable", {}).get("pods")
+      try:
+        alloc += int(a)
+      except Exception:
+        pass
+
+    used = 0
+    pending = 0
+    for p in pods.get("items", []):
+      phase = p.get("status", {}).get("phase")
+      if phase in ("Succeeded", "Failed"):
+        continue
+      if phase == "Pending":
+        pending += 1
+      if p.get("spec", {}).get("nodeName"):
+        used += 1
+
+    free = alloc - used
+    print(json.dumps({"alloc": alloc, "used": used, "free": free, "pending": pending}))
+    PY
+  register: pod_capacity
+  changed_when: false
+
+- name: Parse capacity metrics
+  ansible.builtin.set_fact:
+    pod_capacity_metrics: "{{ pod_capacity.stdout | from_json }}"
+
+- name: Fail early if pod capacity is too low
+  when:
+    - pod_capacity_fail
+    - (pod_capacity_metrics.free | int) < (pod_capacity_min_free_slots | int)
+  ansible.builtin.fail:
+    msg: >-
+      Pod capacity preflight failed for context '{{ k8s_context }}'.
+      allocatable_pods={{ pod_capacity_metrics.alloc }}, used_pods={{ pod_capacity_metrics.used }},
+      free_slots={{ pod_capacity_metrics.free }}, pending_pods={{ pod_capacity_metrics.pending }}.
+
+      This usually causes OLM installs to stall with '0/1 nodes are available: Too many pods'.
+      Fix: remove non-demo workloads to free pod slots, or increase node pod capacity (Kubelet maxPods) if acceptable.
+

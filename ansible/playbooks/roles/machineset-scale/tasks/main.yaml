@@ -1,0 +1,127 @@
+---
+# Scale worker MachineSets on OpenShift clusters.
+#
+# Goal: ensure enough worker nodes exist before installing pod-heavy components.
+#
+# Variables:
+# - k8s_context (required)
+# - machineset_namespace (default: openshift-machine-api)
+# - machineset_target_worker_replicas_total (default: 2)
+# - machineset_wait (default: true)
+# - machineset_wait_retries (default: 60)
+# - machineset_wait_delay (default: 30)
+
+- name: Set defaults
+  ansible.builtin.set_fact:
+    machineset_namespace: "{{ machineset_namespace | default('openshift-machine-api') }}"
+    machineset_target_worker_replicas_total: "{{ machineset_target_worker_replicas_total | default(2) | int }}"
+    machineset_wait: "{{ machineset_wait | default(true) | bool }}"
+    machineset_wait_retries: "{{ machineset_wait_retries | default(60) | int }}"
+    machineset_wait_delay: "{{ machineset_wait_delay | default(30) | int }}"
+    machineset_skip_if_unsupported: "{{ machineset_skip_if_unsupported | default(true) | bool }}"
+    machineset_api_wait_retries: "{{ machineset_api_wait_retries | default(60) | int }}"
+    machineset_api_wait_delay: "{{ machineset_api_wait_delay | default(10) | int }}"
+
+- name: Wait for API server to be reachable (SNO/MCO reboot safe)
+  ansible.builtin.shell: |
+    set -e
+    oc --context {{ k8s_context }} get --raw /readyz >/dev/null
+  register: api_ready
+  changed_when: false
+  failed_when: false
+  until: api_ready.rc == 0
+  retries: "{{ machineset_api_wait_retries }}"
+  delay: "{{ machineset_api_wait_delay }}"
+
+- name: List MachineSets (openshift-machine-api)
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: machine.openshift.io/v1beta1
+    kind: MachineSet
+    namespace: "{{ machineset_namespace }}"
+  register: machinesets
+  changed_when: false
+
+- name: Filter worker MachineSets
+  ansible.builtin.set_fact:
+    worker_machinesets: >-
+      {{
+        (machinesets.resources | default([])) |
+        selectattr('metadata.labels', 'defined') |
+        selectattr('metadata.labels.machine.openshift.io/cluster-api-machine-role', 'defined') |
+        selectattr('metadata.labels.machine.openshift.io/cluster-api-machine-role', 'equalto', 'worker') |
+        list
+      }}
+    current_worker_replicas_total: >-
+      {{
+        (
+          (machinesets.resources | default([])) |
+          selectattr('metadata.labels', 'defined') |
+          selectattr('metadata.labels.machine.openshift.io/cluster-api-machine-role', 'defined') |
+          selectattr('metadata.labels.machine.openshift.io/cluster-api-machine-role', 'equalto', 'worker') |
+          map(attribute='spec.replicas') |
+          map('default', 0) |
+          list
+        ) | sum
+      }}
+
+- name: Get current worker node count
+  ansible.builtin.shell: |
+    set -e
+    oc --context {{ k8s_context }} get nodes -l node-role.kubernetes.io/worker --no-headers 2>/dev/null | wc -l | tr -d ' '
+  register: current_worker_nodes_count
+  changed_when: false
+
+- name: Fail if scaling is required but no worker MachineSets exist
+  when:
+    - (worker_machinesets | length) == 0
+    - (current_worker_nodes_count.stdout | int) < (machineset_target_worker_replicas_total | int)
+    - not machineset_skip_if_unsupported
+  ansible.builtin.fail:
+    msg: >-
+      Cannot scale worker capacity on context '{{ k8s_context }}' because no worker MachineSets were found
+      in namespace '{{ machineset_namespace }}'. Current worker nodes={{ current_worker_nodes_count.stdout }},
+      target={{ machineset_target_worker_replicas_total }}.
+
+      This typically means the cluster is Single Node OpenShift (SNO) or not using Machine API.
+      Fix: create/use an IPI cluster with MachineSets (so nodes can be added), or set
+      `-e machineset_skip_if_unsupported=true` to continue without scaling (not recommended for pod-heavy installs).
+
+- name: Skip scaling if cluster does not use MachineSets
+  when:
+    - (worker_machinesets | length) == 0
+    - (current_worker_nodes_count.stdout | int) >= (machineset_target_worker_replicas_total | int) or machineset_skip_if_unsupported
+  ansible.builtin.debug:
+    msg: >-
+      No worker MachineSets found in {{ machineset_namespace }} (context={{ k8s_context }}).
+      Current worker nodes={{ current_worker_nodes_count.stdout }}, target={{ machineset_target_worker_replicas_total }}.
+      Skipping MachineSet scaling.
+
+- name: Scale up first worker MachineSet to reach target total
+  when:
+    - worker_machinesets | length > 0
+    - current_worker_replicas_total < machineset_target_worker_replicas_total
+  ansible.builtin.shell: |
+    set -e
+    ms="{{ worker_machinesets[0].metadata.name }}"
+    cur="{{ worker_machinesets[0].spec.replicas | default(0) | int }}"
+    delta="{{ (machineset_target_worker_replicas_total - current_worker_replicas_total) | int }}"
+    new=$((cur + delta))
+    echo "Scaling MachineSet ${ms} from ${cur} to ${new} (target_total={{ machineset_target_worker_replicas_total }}, current_total={{ current_worker_replicas_total }})"
+    oc --context {{ k8s_context }} -n {{ machineset_namespace }} patch machineset "${ms}" --type=merge --patch "{\"spec\": {\"replicas\": ${new}}}"
+  register: machineset_scale
+  changed_when: machineset_scale.rc == 0
+
+- name: Wait for worker nodes to reach target (best effort)
+  when:
+    - machineset_wait
+    - worker_machinesets | length > 0
+  ansible.builtin.shell: |
+    set -e
+    oc --context {{ k8s_context }} get nodes -l node-role.kubernetes.io/worker --no-headers 2>/dev/null | wc -l | tr -d ' '
+  register: worker_nodes_count
+  changed_when: false
+  until: (worker_nodes_count.stdout | int) >= (machineset_target_worker_replicas_total | int)
+  retries: "{{ machineset_wait_retries }}"
+  delay: "{{ machineset_wait_delay }}"
+

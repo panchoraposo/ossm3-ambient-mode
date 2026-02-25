@@ -1,0 +1,73 @@
+---
+# Approve pending kubelet-serving CSRs so apiserver can reach kubelet (/10250).
+#
+# This is especially useful on SNO after kubelet restarts/rollouts, where the
+# cluster-machine-approver may be delayed and CSRs can accumulate, breaking
+# `oc logs/exec/debug` with "tls: internal error".
+#
+# Variables:
+# - k8s_context (required)
+# - csr_signer_name (default: kubernetes.io/kubelet-serving)
+# - csr_approve (default: true)
+# - csr_approve_retries (default: 30)
+# - csr_approve_delay (default: 10)
+
+- name: Set defaults
+  ansible.builtin.set_fact:
+    csr_signer_name: "{{ csr_signer_name | default('kubernetes.io/kubelet-serving') }}"
+    csr_approve: "{{ csr_approve | default(true) | bool }}"
+    csr_approve_retries: "{{ csr_approve_retries | default(30) | int }}"
+    csr_approve_delay: "{{ csr_approve_delay | default(10) | int }}"
+
+- name: Skip CSR approval if disabled
+  when: not (csr_approve | bool)
+  ansible.builtin.debug:
+    msg: "CSR approval is disabled (set -e csr_approve=true to enable)."
+
+- name: List CertificateSigningRequests
+  when: (csr_approve | bool)
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: certificates.k8s.io/v1
+    kind: CertificateSigningRequest
+  register: csrs
+  changed_when: false
+
+- name: Select pending kubelet-serving CSRs
+  when: (csr_approve | bool)
+  ansible.builtin.set_fact:
+    pending_kubelet_serving_csrs: >-
+      {{
+        (csrs.resources | default([])) |
+        selectattr('spec.signerName', 'defined') |
+        selectattr('spec.signerName', 'equalto', csr_signer_name) |
+        rejectattr('status.conditions', 'defined') |
+        map(attribute='metadata.name') |
+        list
+      }}
+
+- name: Approve pending kubelet-serving CSRs (best effort)
+  when:
+    - (csr_approve | bool)
+    - pending_kubelet_serving_csrs | length > 0
+  ansible.builtin.shell: |
+    set -e
+    oc --context {{ k8s_context }} adm certificate approve {{ item }}
+  loop: "{{ pending_kubelet_serving_csrs }}"
+  register: csr_approvals
+  changed_when: true
+  failed_when: false
+
+- name: Wait for kubelet proxy healthz to become reachable (optional)
+  when: (csr_approve | bool)
+  ansible.builtin.shell: |
+    set -e
+    node="$(oc --context {{ k8s_context }} get nodes -o jsonpath='{.items[0].metadata.name}')"
+    oc --context {{ k8s_context }} get --raw "/api/v1/nodes/${node}/proxy/healthz" >/dev/null
+  register: kubelet_proxy
+  changed_when: false
+  failed_when: false
+  until: kubelet_proxy.rc == 0
+  retries: "{{ csr_approve_retries }}"
+  delay: "{{ csr_approve_delay }}"
+

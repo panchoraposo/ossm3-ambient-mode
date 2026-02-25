@@ -19,12 +19,25 @@
               istio-discovery: enabled
               openshift.io/user-monitoring: "true"
 
-    - name: Deploy per-service waypoints (reviews/ratings/details)
+    - name: Deploy per-service waypoints (productpage/reviews/ratings/details)
       kubernetes.core.k8s:
         context: "{{ k8s_context }}"
         state: present
         definition: "{{ item }}"
       loop:
+        - apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: productpage-waypoint
+            namespace: "{{ app_ns }}"
+            labels:
+              istio.io/waypoint-for: all
+          spec:
+            gatewayClassName: istio-waypoint
+            listeners:
+            - name: mesh
+              port: 15008
+              protocol: HBONE
         - apiVersion: gateway.networking.k8s.io/v1
           kind: Gateway
           metadata:
@@ -90,11 +103,12 @@
             labels:
               istio.io/use-waypoint: "{{ item.waypoint }}"
       loop:
+        - { name: productpage, waypoint: "productpage-waypoint" }
         - { name: reviews, waypoint: "reviews-waypoint" }
         - { name: ratings, waypoint: "ratings-waypoint" }
         - { name: details, waypoint: "details-waypoint" }
 
-    - name: Enroll backend workloads (deployments) to use their per-service waypoint
+    - name: Enroll productpage workload (deployment) to use its per-service waypoint
       kubernetes.core.k8s:
         context: "{{ k8s_context }}"
         state: patched
@@ -109,11 +123,7 @@
                 labels:
                   istio.io/use-waypoint: "{{ item.waypoint }}"
       loop:
-        - { name: details-v1, waypoint: "details-waypoint" }
-        - { name: ratings-v1, waypoint: "ratings-waypoint" }
-        - { name: reviews-v1, waypoint: "reviews-waypoint" }
-        - { name: reviews-v2, waypoint: "reviews-waypoint" }
-        - { name: reviews-v3, waypoint: "reviews-waypoint" }
+        - { name: productpage-v1, waypoint: "productpage-waypoint" }
 
     - name: Create PodMonitor for waypoints (metrics for Kiali graph)
       kubernetes.core.k8s:
@@ -133,7 +143,7 @@
               matchExpressions:
                 - key: gateway.networking.k8s.io/gateway-name
                   operator: In
-                  values: ["reviews-waypoint","ratings-waypoint","details-waypoint"]
+                  values: ["productpage-waypoint","reviews-waypoint","ratings-waypoint","details-waypoint"]
             podMetricsEndpoints:
             - path: /stats/prometheus
               port: http-envoy-prom

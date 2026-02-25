@@ -1,0 +1,82 @@
+---
+# Installs the Grafana Operator via OLM on OpenShift.
+#
+# Defaults match the current ACM manual install observed:
+# - package: grafana-operator
+# - source: community-operators
+# - channel: v5
+# - subscription namespace: openshift-operators
+#
+# Variables:
+# - k8s_context (required)
+# - grafana_operator_package_name (default: grafana-operator)
+# - grafana_operator_channel (default: v5)
+# - grafana_operator_catalog_source (default: community-operators)
+# - grafana_operator_catalog_source_ns (default: openshift-marketplace)
+# - grafana_operator_subscription_ns (default: openshift-operators)
+
+- name: Set defaults
+  ansible.builtin.set_fact:
+    grafana_operator_package_name: "{{ grafana_operator_package_name | default('grafana-operator') }}"
+    grafana_operator_channel: "{{ grafana_operator_channel | default('v5') }}"
+    grafana_operator_catalog_source: "{{ grafana_operator_catalog_source | default('community-operators') }}"
+    grafana_operator_catalog_source_ns: "{{ grafana_operator_catalog_source_ns | default('openshift-marketplace') }}"
+    grafana_operator_subscription_ns: "{{ grafana_operator_subscription_ns | default('openshift-operators') }}"
+
+- name: Verify Grafana Operator PackageManifest exists
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: packages.operators.coreos.com/v1
+    kind: PackageManifest
+    name: "{{ grafana_operator_package_name }}"
+    namespace: "{{ grafana_operator_catalog_source_ns }}"
+  register: grafana_pm
+  failed_when: false
+  changed_when: false
+
+- name: Fail if Grafana Operator PackageManifest is missing
+  when: grafana_pm.resources | default([]) | length == 0
+  ansible.builtin.fail:
+    msg: >-
+      PackageManifest '{{ grafana_operator_package_name }}' was not found in namespace '{{ grafana_operator_catalog_source_ns }}'.
+      Ensure the OperatorHub source '{{ grafana_operator_catalog_source }}' is available on the cluster.
+
+- name: Create/Update Subscription for Grafana Operator
+  kubernetes.core.k8s:
+    context: "{{ k8s_context }}"
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ grafana_operator_package_name }}"
+        namespace: "{{ grafana_operator_subscription_ns }}"
+      spec:
+        channel: "{{ grafana_operator_channel }}"
+        installPlanApproval: Automatic
+        name: "{{ grafana_operator_package_name }}"
+        source: "{{ grafana_operator_catalog_source }}"
+        sourceNamespace: "{{ grafana_operator_catalog_source_ns }}"
+
+- name: Wait for Grafana Operator CSV to be Succeeded
+  kubernetes.core.k8s_info:
+    context: "{{ k8s_context }}"
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ grafana_operator_subscription_ns }}"
+  register: grafana_csvs
+  until: >-
+    (
+      grafana_csvs.resources | default([]) |
+      selectattr('metadata', 'defined') |
+      selectattr('metadata.name', 'defined') |
+      selectattr('metadata.name', 'search', 'grafana-operator') |
+      selectattr('status', 'defined') |
+      selectattr('status.phase', 'defined') |
+      selectattr('status.phase', 'equalto', 'Succeeded') |
+      list | length
+    ) > 0
+  retries: 60
+  delay: 10
+  changed_when: false
+
