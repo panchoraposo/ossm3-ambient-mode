@@ -1,2 +1,5 @@
 - name: Install OpenShift GitOps operator
   include_tasks: install-operator.yaml
+
+- name: Deploy Bookinfo GitOps multi-cluster ApplicationSet (east + west)
+  include_tasks: bookinfo-appset.yaml

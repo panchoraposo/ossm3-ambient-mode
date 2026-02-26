@@ -1,0 +1,14 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: bookinfo-gateway
+  namespace: bookinfo
+spec:
+  to:
+    kind: Service
+    name: bookinfo-gateway-istio
+    weight: 100
+  port:
+    targetPort: 80
+  wildcardPolicy: None
+

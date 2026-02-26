@@ -1,0 +1,41 @@
+---
+- name: Create ApplicationSet for Bookinfo (east + west)
+  kubernetes.core.k8s:
+    context: "{{ k8s_context | default(omit) }}"
+    state: present
+    definition:
+      apiVersion: argoproj.io/v1alpha1
+      kind: ApplicationSet
+      metadata:
+        name: bookinfo-east-west
+        namespace: "{{ argocd_namespace | default('openshift-gitops') }}"
+      spec:
+        generators:
+          - clusters:
+              selector:
+                matchExpressions:
+                  - key: apps.open-cluster-management.io/cluster-name
+                    operator: In
+                    values: ["east", "west"]
+        template:
+          metadata:
+            name: "bookinfo-{{name}}"
+            namespace: "{{ argocd_namespace | default('openshift-gitops') }}"
+          spec:
+            project: default
+            source:
+              repoURL: "{{ gitops_repo }}"
+              targetRevision: main
+              path: apps/bookinfo/overlays/acm
+            destination:
+              server: "{{server}}"
+              namespace: bookinfo
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+                - PruneLast=true
+                - ServerSideApply=true
+

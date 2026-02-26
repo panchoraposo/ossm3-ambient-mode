@@ -163,6 +163,22 @@
         src: "{{ bookinfo_versions_yaml | default('https://raw.githubusercontent.com/openshift-service-mesh/istio/release-1.27/samples/bookinfo/platform/kube/bookinfo-versions.yaml') }}"
         state: present
 
+    - name: Remove versioned Bookinfo Services (keep only stable Services)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: absent
+        api_version: v1
+        kind: Service
+        namespace: "{{ app_ns }}"
+        name: "{{ item }}"
+      loop:
+        - productpage-v1
+        - details-v1
+        - reviews-v1
+        - reviews-v2
+        - reviews-v3
+        - ratings-v1
+
     - name: Label Bookinfo services as global (istio.io/global=true)
       kubernetes.core.k8s:
         context: "{{ k8s_context }}"
