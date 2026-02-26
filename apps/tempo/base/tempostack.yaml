@@ -22,6 +22,16 @@ spec:
             memory: 1Gi
       jaegerQuery:
         enabled: true
+        authentication:
+          enabled: true
+          sar: '{"namespace": "istio-system", "resource": "pods", "verb": "get"}'
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
         findTracesConcurrentRequests: 2
         resources:
           requests:

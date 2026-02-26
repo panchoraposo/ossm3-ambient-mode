@@ -49,11 +49,6 @@
     promxy_upstream_tokens_stringData: "{{ promxy_upstream_tokens_stringData | default({}) | combine({ (item.item ~ '.token'): item.stdout }) }}"
   loop: "{{ promxy_metrics_reader_tokens.results }}"
 
-- name: Build promxy hostAliases (pin Thanos route hosts to IPs)
-  set_fact:
-    promxy_hostAliases: "{{ promxy_hostAliases | default([]) + [ {'ip': thanos_route_ip_by_cluster[item], 'hostnames': [thanos_route_host_by_cluster[item]] } ] }}"
-  loop: "{{ promxy_clusters }}"
-
 - name: Create promxy upstream tokens secret
   kubernetes.core.k8s:
     context: "{{ k8s_context }}"
@@ -95,6 +90,9 @@
               - static_configs:
                   - targets:
                       - {{ thanos_route_host_by_cluster[c] }}
+                # If a managed cluster is temporarily unreachable from the hub
+                # network (common in demo envs), keep serving partial results.
+                ignore_error: true
                 scheme: https
                 http_client:
                   tls_config:
@@ -124,9 +122,6 @@
             labels:
               app: "{{ promxy_name }}"
           spec:
-            # Avoid DNS timeouts during large fan-out PromQL queries by pinning
-            # Thanos route hosts to their current router IPs (PoC hardening).
-            hostAliases: "{{ promxy_hostAliases }}"
             containers:
               - name: promxy
                 image: quay.io/jacksontj/promxy:v0.0.92

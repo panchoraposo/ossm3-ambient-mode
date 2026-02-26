@@ -113,6 +113,7 @@
     - name: Set Tempo query URL for Kiali (Jaeger Query API)
       set_fact:
         tempo_query_http_url: "http://tempo-tempo-query-frontend.istio-system.svc.cluster.local:16686"
+        tempo_jaeger_query_url: "http://{{ acm_tempo_jaeger_query_http_host }}"
 
     - name: Get ACM OpenShift Ingress Domain (for promxy route)
       ansible.builtin.shell: |
@@ -194,3 +195,4 @@
       vars:
         promxy_host: "{{ hostvars['localhost'].promxy_host }}"
         tempo_query_http_url: "{{ hostvars['localhost'].tempo_query_http_url }}"
+        tempo_jaeger_query_url: "{{ hostvars['localhost'].tempo_jaeger_query_url }}"
