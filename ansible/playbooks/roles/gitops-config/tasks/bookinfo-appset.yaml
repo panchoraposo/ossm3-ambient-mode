@@ -19,7 +19,7 @@
                     values: ["east", "west"]
         template:
           metadata:
-            name: "bookinfo-{{name}}"
+            name: "bookinfo-{{ '{{name}}' }}"
             namespace: "{{ argocd_namespace | default('openshift-gitops') }}"
           spec:
             project: default
@@ -28,7 +28,7 @@
               targetRevision: main
               path: apps/bookinfo/overlays/acm
             destination:
-              server: "{{server}}"
+              server: "{{ '{{server}}' }}"
               namespace: bookinfo
             syncPolicy:
               automated:
