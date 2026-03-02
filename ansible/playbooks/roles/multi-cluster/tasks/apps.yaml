@@ -90,41 +90,6 @@
               istio.io/use-waypoint: null
               openshift.io/user-monitoring: "true"
 
-    - name: Enroll services to use their per-service waypoint
-      kubernetes.core.k8s:
-        context: "{{ k8s_context }}"
-        state: patched
-        api_version: v1
-        kind: Service
-        namespace: "{{ app_ns }}"
-        name: "{{ item.name }}"
-        definition:
-          metadata:
-            labels:
-              istio.io/use-waypoint: "{{ item.waypoint }}"
-      loop:
-        - { name: productpage, waypoint: "productpage-waypoint" }
-        - { name: reviews, waypoint: "reviews-waypoint" }
-        - { name: ratings, waypoint: "ratings-waypoint" }
-        - { name: details, waypoint: "details-waypoint" }
-
-    - name: Enroll productpage workload (deployment) to use its per-service waypoint
-      kubernetes.core.k8s:
-        context: "{{ k8s_context }}"
-        state: patched
-        api_version: apps/v1
-        kind: Deployment
-        namespace: "{{ app_ns }}"
-        name: "{{ item.name }}"
-        definition:
-          spec:
-            template:
-              metadata:
-                labels:
-                  istio.io/use-waypoint: "{{ item.waypoint }}"
-      loop:
-        - { name: productpage-v1, waypoint: "productpage-waypoint" }
-
     - name: Create PodMonitor for waypoints (metrics for Kiali graph)
       kubernetes.core.k8s:
         context: "{{ k8s_context }}"
@@ -179,23 +144,39 @@
         - reviews-v3
         - ratings-v1
 
-    - name: Label Bookinfo services as global (istio.io/global=true)
+    - name: Label Bookinfo services (waypoint + global)
       kubernetes.core.k8s:
         context: "{{ k8s_context }}"
         state: patched
         api_version: v1
         kind: Service
         namespace: "{{ app_ns }}"
-        name: "{{ item }}"
+        name: "{{ item.name }}"
         definition:
           metadata:
             labels:
+              istio.io/use-waypoint: "{{ item.waypoint }}"
               istio.io/global: "true"
       loop:
-        - productpage
-        - details
-        - reviews
-        - ratings
+        - { name: productpage, waypoint: "productpage-waypoint" }
+        - { name: reviews, waypoint: "reviews-waypoint" }
+        - { name: ratings, waypoint: "ratings-waypoint" }
+        - { name: details, waypoint: "details-waypoint" }
+
+    - name: Enroll productpage workload (deployment) to use its per-service waypoint
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: patched
+        api_version: apps/v1
+        kind: Deployment
+        namespace: "{{ app_ns }}"
+        name: productpage-v1
+        definition:
+          spec:
+            template:
+              metadata:
+                labels:
+                  istio.io/use-waypoint: productpage-waypoint
 
     - name: Ensure backends are enrolled in ambient on WEST (remove disabling template flags)
       when: inventory_hostname == 'west'
