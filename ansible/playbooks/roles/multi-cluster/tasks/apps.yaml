@@ -288,3 +288,152 @@
         - name: Display Route URL
           debug:
             msg: "Bookinfo is available at: http://bookinfo.{{ ingress_config.resources[0].spec.domain }}/productpage"
+
+    - name: Deploy bookinfo-external (cross-namespace identity test) on EAST only
+      when: inventory_hostname == 'east'
+      block:
+        - name: Create bookinfo-external namespace (ambient mode)
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: bookinfo-external
+                labels:
+                  istio.io/dataplane-mode: ambient
+
+        - name: Deploy bookinfo-external resources
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            state: present
+            definition: "{{ item }}"
+          loop:
+            - apiVersion: v1
+              kind: ServiceAccount
+              metadata:
+                name: bookinfo-external-productpage
+                namespace: bookinfo-external
+            - apiVersion: v1
+              kind: Service
+              metadata:
+                name: productpage
+                namespace: bookinfo-external
+                labels:
+                  app: productpage
+              spec:
+                ports:
+                - port: 9080
+                  name: http
+                  targetPort: 9080
+                selector:
+                  app: productpage
+            - apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: productpage-v1
+                namespace: bookinfo-external
+                labels:
+                  app: productpage
+                  version: v1
+              spec:
+                replicas: 1
+                selector:
+                  matchLabels:
+                    app: productpage
+                    version: v1
+                template:
+                  metadata:
+                    labels:
+                      app: productpage
+                      version: v1
+                  spec:
+                    serviceAccountName: bookinfo-external-productpage
+                    containers:
+                    - name: productpage
+                      image: "quay.io/sail-dev/examples-bookinfo-productpage-v1:1.20.3"
+                      ports:
+                      - containerPort: 9080
+                      env:
+                      - name: SERVICES_DOMAIN
+                        value: "bookinfo.svc.cluster.local"
+                      volumeMounts:
+                      - mountPath: /tmp
+                        name: tmp
+                    volumes:
+                    - emptyDir: {}
+                      name: tmp
+
+        - name: Create bookinfo-external Gateway
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            definition:
+              apiVersion: gateway.networking.k8s.io/v1
+              kind: Gateway
+              metadata:
+                name: bookinfo-external-gateway
+                namespace: bookinfo-external
+                annotations:
+                  networking.istio.io/service-type: ClusterIP
+              spec:
+                gatewayClassName: istio
+                listeners:
+                - name: http
+                  port: 80
+                  protocol: HTTP
+                  allowedRoutes:
+                    namespaces:
+                      from: Same
+
+        - name: Create bookinfo-external HTTPRoute
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            definition:
+              apiVersion: gateway.networking.k8s.io/v1
+              kind: HTTPRoute
+              metadata:
+                name: bookinfo-external
+                namespace: bookinfo-external
+              spec:
+                parentRefs:
+                - name: bookinfo-external-gateway
+                rules:
+                - matches:
+                  - path: { type: PathPrefix, value: /productpage }
+                  - path: { type: PathPrefix, value: /static }
+                  - path: { type: PathPrefix, value: /login }
+                  - path: { type: PathPrefix, value: /logout }
+                  backendRefs:
+                  - name: productpage
+                    port: 9080
+
+        - name: Get OpenShift Ingress Domain for bookinfo-external
+          kubernetes.core.k8s_info:
+            context: "{{ k8s_context }}"
+            api_version: config.openshift.io/v1
+            kind: Ingress
+            name: cluster
+          register: ext_ingress_config
+
+        - name: Create bookinfo-external Route
+          kubernetes.core.k8s:
+            context: "{{ k8s_context }}"
+            definition:
+              apiVersion: route.openshift.io/v1
+              kind: Route
+              metadata:
+                name: bookinfo-external-gateway
+                namespace: bookinfo-external
+              spec:
+                host: "bookinfo-external.{{ ext_ingress_config.resources[0].spec.domain }}"
+                to:
+                  kind: Service
+                  name: bookinfo-external-gateway-istio
+                  weight: 100
+                port:
+                  targetPort: 80
+                wildcardPolicy: None
+
+        - name: Display bookinfo-external Route URL
+          debug:
+            msg: "Bookinfo-external is available at: http://bookinfo-external.{{ ext_ingress_config.resources[0].spec.domain }}/productpage"

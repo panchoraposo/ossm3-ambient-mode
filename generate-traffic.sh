@@ -11,6 +11,7 @@ echo "Discovering Bookinfo Routes (east + west)..."
 # 1. Get the Hosts directly from the OpenShift Routes
 HOST_EAST=$(oc --context east get route "$ROUTE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || true)
 HOST_WEST=$(oc --context west get route "$ROUTE_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.host}' 2>/dev/null || true)
+HOST_EXTERNAL=$(oc --context east get route bookinfo-external-gateway -n bookinfo-external -o jsonpath='{.spec.host}' 2>/dev/null || true)
 
 # 2. Validation
 if [ -z "$HOST_EAST" ]; then
@@ -26,9 +27,13 @@ fi
 URL_EAST="http://${HOST_EAST}${APP_PATH}"
 URL_WEST="http://${HOST_WEST}${APP_PATH}"
 
-echo "East URL: $URL_EAST"
-echo "West URL: $URL_WEST"
-echo "Generating traffic to BOTH clusters... (CTRL+C to stop)"
+echo "East URL:     $URL_EAST"
+echo "West URL:     $URL_WEST"
+if [ -n "$HOST_EXTERNAL" ]; then
+  URL_EXTERNAL="http://${HOST_EXTERNAL}${APP_PATH}"
+  echo "External URL: $URL_EXTERNAL"
+fi
+echo "Generating traffic... (CTRL+C to stop)"
 echo "------------------------------------------------"
 
 traffic_loop() {
@@ -44,14 +49,22 @@ traffic_loop() {
 }
 
 # 4. Traffic Loop (parallel)
+PIDS=()
+
 traffic_loop "east" "$URL_EAST" &
-PID_EAST=$!
+PIDS+=($!)
+
 traffic_loop "west" "$URL_WEST" &
-PID_WEST=$!
+PIDS+=($!)
+
+if [ -n "$URL_EXTERNAL" ]; then
+  traffic_loop "external" "$URL_EXTERNAL" &
+  PIDS+=($!)
+fi
 
 cleanup() {
-  kill "$PID_EAST" "$PID_WEST" 2>/dev/null || true
-  wait "$PID_EAST" "$PID_WEST" 2>/dev/null || true
+  kill "${PIDS[@]}" 2>/dev/null || true
+  wait "${PIDS[@]}" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
