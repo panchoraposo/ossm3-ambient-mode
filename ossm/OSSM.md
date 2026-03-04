@@ -1,261 +1,360 @@
-# OpenShift Service Mesh 3.2 — Ambient Mode
+# OpenShift Service Mesh 3.2 — Ambient Mode Reference Guide
 
-## De Sidecars a Ambient Mode
-
-### El modelo sidecar (OSSM 2.x / Istio clásico)
-
-En OSSM 2.x, cada pod de la aplicación tenía un **contenedor Envoy inyectado** (sidecar). Todo el tráfico entrante y saliente del pod pasaba por ese Envoy:
-
-```
-[Pod: productpage]
-  ├── container: productpage (la app)
-  └── container: istio-proxy (Envoy sidecar) ← intercepta todo el tráfico
-```
-
-El sidecar hacía TODO: mTLS, L4, L7, métricas, tracing, policies. Funcionaba, pero tenía costes:
-
-- **Recursos**: cada pod consumía CPU/RAM extra por el sidecar
-- **Latencia**: cada hop pasaba por dos Envoys (source + destination)
-- **Operaciones**: actualizar Istio requería reiniciar todos los pods para actualizar los sidecars
-
-### El modelo ambient (OSSM 3.2)
-
-Ambient mode **elimina los sidecars**. En su lugar divide las responsabilidades en dos capas:
-
-```
-┌─────────────────────────────────────────────────┐
-│  CAPA L7 (opcional)     →  Waypoint Proxies     │
-│  (HTTP routing, retries, AuthZ L7, métricas)    │
-├─────────────────────────────────────────────────┤
-│  CAPA L4 (siempre)      →  ztunnel              │
-│  (mTLS, identidad SPIFFE, TCP metrics)          │
-└─────────────────────────────────────────────────┘
-```
-
-Los pods son **limpios**, sin sidecar — muestran `1/1 READY` en vez del `2/2` que se veía con sidecars.
+This document provides a comprehensive reference for **Red Hat OpenShift Service Mesh (OSSM) 3.2** in **ambient mode**. It covers the architecture, key components, traffic flow, and operational considerations based on hands-on experience with the bookinfo application across a multi-cluster (Multi-Primary) OpenShift 4.20 environment.
 
 ---
 
-## Componentes
+## From Sidecars to Ambient Mode
 
-### 1. ztunnel (capa L4 — siempre activa)
+### The sidecar model (OSSM 2.x / classic Istio)
 
-Es un **DaemonSet** que corre un pod por nodo (namespace `ztunnel`). Es un proxy ligero escrito en Rust (no es Envoy) que:
-
-- **Intercepta todo el tráfico** de los pods en namespaces ambient (vía reglas del CNI)
-- Establece **mTLS automático** entre pods (identidad SPIFFE, certificados X.509)
-- Crea **túneles HBONE** para transportar el tráfico (ver sección siguiente)
-- Proporciona métricas L4 (bytes, conexiones TCP)
-
-Cuando un pod envía tráfico a otro pod:
+In OSSM 2.x, every application pod had an **Envoy sidecar container injected**. All inbound and outbound traffic passed through that Envoy:
 
 ```
-productpage → [ztunnel nodo origen] ==HBONE/mTLS==> [ztunnel nodo destino] → reviews
+[Pod: productpage]
+  ├── container: productpage (the application)
+  └── container: istio-proxy (Envoy sidecar) ← intercepts all traffic
 ```
 
-El pod nunca se entera de que su tráfico está siendo interceptado.
+The sidecar handled everything: mTLS, L4, L7, metrics, tracing, policies. It worked, but had costs:
 
-#### mTLS en ambient mode
+- **Resources**: each pod consumed extra CPU/RAM for the sidecar
+- **Latency**: each hop passed through two Envoys (source + destination)
+- **Operations**: upgrading Istio required restarting all pods to update their sidecars
+- **Blast radius**: a misconfigured sidecar could break the application pod
 
-**mTLS está activo automáticamente.** No se necesita configurar `PeerAuthentication` ni `DestinationRule` como en sidecar mode. En el momento en que el namespace tiene `istio.io/dataplane-mode: ambient`, el ztunnel cifra todo el tráfico entre pods con mTLS usando certificados SPIFFE emitidos por istiod.
+### The ambient model (OSSM 3.2)
 
-Cada workload recibe una identidad SPIFFE automáticamente, verificable en los logs del ztunnel:
-
-```
-src.identity="spiffe://cluster.local/ns/bookinfo/sa/bookinfo-gateway-istio"
-dst.identity="spiffe://cluster.local/ns/bookinfo/sa/bookinfo-productpage"
-```
-
-#### ¿Qué es HBONE?
-
-HBONE = **HTTP-Based Overlay Network Environment**. Es el protocolo de transporte que usa Istio para ambient mode.
-
-En sidecar mode, los Envoys se hablaban entre sí con mTLS directo (TCP puro cifrado con TLS). En ambient, el ztunnel usa algo más sofisticado: un túnel **HTTP/2 CONNECT** encapsulado dentro de una conexión **mTLS** en el puerto **15008**:
+Ambient mode **eliminates sidecars**. Instead, it splits responsibilities into two layers:
 
 ```
-Pod A → ztunnel A → [HTTP/2 CONNECT sobre mTLS, puerto 15008] → ztunnel B → Pod B
+┌─────────────────────────────────────────────────┐
+│  L7 LAYER (optional)    →  Waypoint Proxies     │
+│  (HTTP routing, retries, AuthZ L7, metrics)     │
+├─────────────────────────────────────────────────┤
+│  L4 LAYER (always on)   →  ztunnel              │
+│  (mTLS, SPIFFE identity, TCP metrics)           │
+└─────────────────────────────────────────────────┘
 ```
 
-Capa por capa:
+Application pods are **clean** — no sidecar injected. They show `1/1 READY` instead of the `2/2` seen with sidecars.
 
-- La capa exterior es **TLS** (autenticación mutua con certs SPIFFE)
-- Dentro va un **HTTP/2 CONNECT** que dice "quiero conectar con el pod X en el puerto Y"
-- Dentro del CONNECT va el **tráfico original** de la aplicación (sin modificar)
+---
 
-¿Por qué no usar mTLS directo como antes? Porque HBONE permite:
+## Core Components
 
-- **Multiplexar** varias conexiones de distintos pods sobre un mismo túnel
-- Llevar **metadatos** (identidad, destino original) dentro del protocolo HTTP
-- Funcionar mejor atravesando **load balancers y proxies intermedios** (como el east-west gateway entre clústeres)
+### 1. ztunnel (L4 — always active)
 
-### 2. Waypoint Proxies (capa L7 — opcional por servicio)
+A **DaemonSet** running one pod per node (namespace `ztunnel`). It is a lightweight proxy written in **Rust** (not Envoy) that:
 
-En el modelo sidecar, **todo** pod tenía L7. En ambient, L7 es **opcional** y se activa por servicio mediante los **waypoints**.
+- **Intercepts all traffic** from pods in ambient-enrolled namespaces (via CNI rules)
+- Establishes **automatic mTLS** between pods using SPIFFE X.509 certificates
+- Creates **HBONE tunnels** for encrypted transport (see below)
+- Provides L4 metrics (bytes, TCP connections)
 
-Un waypoint es un **Deployment de Envoy** dedicado a un servicio, desplegado como un `Gateway` de Kubernetes con clase `istio-waypoint`.
+When a pod sends traffic to another pod:
+
+```
+productpage → [ztunnel on source node] ==HBONE/mTLS==> [ztunnel on dest node] → reviews
+```
+
+The application pod is completely unaware that its traffic is being intercepted and encrypted.
+
+#### mTLS in ambient mode
+
+**mTLS is always on by default.** There is no need to configure `PeerAuthentication` or `DestinationRule` as in sidecar mode. As soon as a namespace has `istio.io/dataplane-mode: ambient`, ztunnel encrypts all inter-pod traffic with mTLS using SPIFFE certificates issued by istiod.
+
+Each workload receives a SPIFFE identity automatically, visible in ztunnel logs:
+
+```
+src.identity="spiffe://cluster.local/ns/bookinfo/sa/bookinfo-productpage"
+dst.identity="spiffe://cluster.local/ns/bookinfo/sa/bookinfo-reviews"
+```
+
+> **Demonstrated in**: UC2-T3 (Unified Trust & mTLS Verification), UC2-T4 (mTLS Enforcement with PeerAuthentication STRICT)
+
+#### What is HBONE?
+
+HBONE = **HTTP-Based Overlay Network Environment**. It is the transport protocol used by Istio in ambient mode.
+
+In sidecar mode, Envoys communicated via direct mTLS (raw TCP encrypted with TLS). In ambient mode, ztunnel uses something more sophisticated: an **HTTP/2 CONNECT** tunnel encapsulated inside an **mTLS** connection on port **15008**:
+
+```
+Pod A → ztunnel A → [HTTP/2 CONNECT over mTLS, port 15008] → ztunnel B → Pod B
+```
+
+Layer by layer:
+
+- The outer layer is **TLS** (mutual authentication with SPIFFE certificates)
+- Inside is an **HTTP/2 CONNECT** that says "I want to connect to pod X on port Y"
+- Inside the CONNECT is the **original application traffic** (unmodified)
+
+Why not use direct mTLS like before? Because HBONE enables:
+
+- **Multiplexing** multiple connections from different pods over a single tunnel
+- Carrying **metadata** (identity, original destination) inside the HTTP protocol
+- Better traversal of **intermediate load balancers and proxies** (such as east-west gateways between clusters)
+
+> **Demonstrated in**: UC2-T3 (HBONE on port 15008 verified in ztunnel logs), UC13 (local-first traffic verified through ztunnel log analysis)
+
+### 2. Waypoint Proxies (L7 — optional, per service)
+
+In the sidecar model, **every** pod had L7 capability. In ambient mode, L7 is **optional** and activated per service through **waypoint proxies**.
+
+A waypoint is an **Envoy Deployment** dedicated to a service, deployed as a Kubernetes `Gateway` with class `istio-waypoint`.
 
 #### GatewayClass: `istio` vs `istio-waypoint`
 
-En la Gateway API de Kubernetes, cada `Gateway` necesita un **GatewayClass** que diga "quién lo implementa". Istio registra dos clases en el clúster:
+In the Kubernetes Gateway API, each `Gateway` needs a **GatewayClass** defining its implementation. Istio registers two classes:
 
-| GatewayClass | Para qué sirve |
+| GatewayClass | Purpose |
 |---|---|
-| `istio` | Gateways de **ingress/egress** (recibe tráfico externo, como `bookinfo-gateway`) |
-| `istio-waypoint` | Waypoint proxies **internos** de la mesh (procesan tráfico L7 entre servicios) |
+| `istio` | **Ingress/egress** gateways (receives external traffic, e.g. `bookinfo-gateway`) |
+| `istio-waypoint` | **Internal** mesh waypoint proxies (processes L7 traffic between services) |
 
-Cuando se crea un Gateway con `gatewayClassName: istio-waypoint`, Istio no crea un ingress, sino que crea un **Deployment de Envoy interno** que actúa como proxy L7 para un servicio de la mesh.
+When a Gateway is created with `gatewayClassName: istio-waypoint`, Istio creates an **internal Envoy Deployment** that acts as an L7 proxy for mesh services.
 
 ```yaml
 kind: Gateway
 metadata:
-  name: productpage-waypoint
+  name: reviews-waypoint
   labels:
-    istio.io/waypoint-for: all    # Aplica a Services y Workloads
+    istio.io/waypoint-for: all
 spec:
   gatewayClassName: istio-waypoint
   listeners:
     - name: mesh
       port: 15008
-      protocol: HBONE             # Recibe tráfico via túnel HBONE
+      protocol: HBONE
 ```
 
-#### `istio.io/waypoint-for`: alcance del waypoint
+#### `istio.io/waypoint-for`: waypoint scope
 
-El label `istio.io/waypoint-for` controla qué tipo de tráfico procesa el waypoint:
+The label `istio.io/waypoint-for` controls what type of traffic the waypoint processes:
 
-| Valor | Qué tráfico procesa |
+| Value | Traffic processed |
 |---|---|
-| `service` | Solo tráfico dirigido al **Service**. **Valor por defecto.** |
-| `workload` | Solo tráfico dirigido directamente al **Pod IP** (bypassing el Service) |
-| `all` | Ambos: tráfico al Service **y** tráfico directo al Pod IP |
+| `service` | Only traffic addressed to the **Service** (ClusterIP). **Default.** |
+| `workload` | Only traffic addressed directly to the **Pod IP** |
+| `all` | Both: Service traffic **and** direct Pod IP traffic |
 
-En este despliegue se usa `all` porque el ingress gateway conecta directamente al Pod IP vía HBONE (no por el Service ClusterIP), así que el waypoint necesita interceptar también ese tráfico directo al workload.
+In this deployment, `all` is used because the ingress gateway connects directly to the Pod IP via HBONE (not via the Service ClusterIP), so the waypoint needs to intercept both types of traffic.
 
-#### Conectar un Service de Kubernetes a su waypoint
+#### Connecting a Kubernetes Service to its waypoint
 
-Se usa el label `istio.io/use-waypoint` en el **Service de Kubernetes**:
+Use the label `istio.io/use-waypoint` on the **Kubernetes Service**:
 
 ```yaml
 kind: Service
 metadata:
-  name: productpage
+  name: reviews
   labels:
-    istio.io/use-waypoint: productpage-waypoint
+    istio.io/use-waypoint: reviews-waypoint
 ```
 
-Sin este label, el tráfico solo pasa por ztunnel (L4). Con el label, el ztunnel desvía el tráfico al waypoint para procesamiento L7 antes de entregarlo al destino.
+Without this label, traffic only passes through ztunnel (L4). With the label, ztunnel redirects traffic to the waypoint for L7 processing before delivering it to the destination.
 
-El label se puede poner a distintos niveles:
+The label can be applied at different scopes:
 
-| Alcance | Dónde poner `istio.io/use-waypoint` | Ejemplo |
+| Scope | Where to put `istio.io/use-waypoint` | Effect |
 |---|---|---|
-| **Per-service** (este despliegue) | En cada `Service` de K8s | Cada servicio de bookinfo tiene su propio waypoint |
-| **Per-namespace** | En el `Namespace` | Todos los servicios del namespace comparten un waypoint |
-| **Per-workload** | En el pod template del `Deployment` | Para interceptar tráfico directo al pod (como productpage-v1) |
+| **Per-service** (this deployment) | On each Kubernetes `Service` | Each bookinfo service has its own waypoint |
+| **Per-namespace** | On the `Namespace` | All services in the namespace share one waypoint |
+| **Per-workload** | On the pod template of the `Deployment` | Intercepts traffic addressed directly to the pod |
 
-Varios Services pueden compartir un mismo waypoint, o cada uno puede tener el suyo (como en este despliegue: 4 Services, 4 waypoints).
+> **Demonstrated in**: UC1-T6 (L4 vs L7 segregation), UC12 (Blue/Green via HTTPRoute + waypoint)
 
 ### 3. Ingress Gateway
 
-Se usa la **Gateway API** de Kubernetes (no los antiguos Istio Gateway/VirtualService):
+Uses the **Kubernetes Gateway API** (not the legacy Istio Gateway/VirtualService):
 
 ```yaml
 kind: Gateway
 metadata:
   name: bookinfo-gateway
 spec:
-  gatewayClassName: istio           # Clase "istio" (no "istio-waypoint")
+  gatewayClassName: istio
   listeners:
     - name: http
       port: 80
       protocol: HTTP
 ```
 
-El gateway pod tiene `istio.io/dataplane-mode: none` (no es interceptado por ztunnel) y su propio Envoy que habla HBONE directamente con los waypoints/ztunnel.
+The gateway pod has `istio.io/dataplane-mode: none` (it is not intercepted by ztunnel) because it runs its own Envoy that speaks HBONE directly with waypoints and ztunnel.
 
-### 4. Namespace enrollment
+An **OpenShift Route** exposes the gateway service externally:
+
+```yaml
+kind: Route
+metadata:
+  name: bookinfo
+spec:
+  host: bookinfo.apps.<cluster-domain>
+  to:
+    kind: Service
+    name: bookinfo-gateway-istio
+```
+
+> **Demonstrated in**: UC12 (Blue/Green via HTTPRoute on the ingress gateway)
+
+### 4. Namespace Enrollment
 
 ```yaml
 kind: Namespace
 metadata:
   name: bookinfo
   labels:
-    istio.io/dataplane-mode: ambient      # Enrolla TODOS los pods en ambient
-    istio-discovery: enabled               # Istiod descubre este namespace
-    openshift.io/user-monitoring: "true"   # Prometheus scraping habilitado
+    istio.io/dataplane-mode: ambient
+    istio-discovery: enabled
+    openshift.io/user-monitoring: "true"
 ```
 
-Con `dataplane-mode: ambient`, todos los pods del namespace son automáticamente interceptados por el ztunnel. No se necesitan labels de inyección en los pods individuales.
+With `dataplane-mode: ambient`, all pods in the namespace are automatically intercepted by ztunnel. No per-pod injection labels needed.
+
+> **Demonstrated in**: UC1-T2 (no sidecars verification), UC2-T2 (bookinfo-external enrolled separately)
 
 ---
 
-## Flujo completo (bookinfo)
+## Traffic Flow (bookinfo)
 
-Cuando un usuario accede a `http://bookinfo.apps.<cluster>/productpage`:
+When a user accesses `http://bookinfo.apps.<cluster>/productpage`:
 
 ```
 Browser
   │
   ▼
-OpenShift Router (HAProxy)           ← Entrada al clúster
+OpenShift Router (HAProxy)           ← Cluster ingress
   │
   ▼
-bookinfo-gateway-istio (Envoy)       ← Gateway API, clase "istio"
-  │                                     Tiene su propio Envoy pero NO es
-  │                                     interceptado por ztunnel
-  │                                     (label: dataplane-mode: none)
+bookinfo-gateway-istio (Envoy)       ← Gateway API, class "istio"
+  │                                     Has its own Envoy, NOT intercepted
+  │                                     by ztunnel (dataplane-mode: none)
   │  HBONE/mTLS
   ▼
-productpage-waypoint (Envoy)         ← Waypoint L7
+productpage-waypoint (Envoy)         ← L7 Waypoint
   │
   │  HBONE/mTLS via ztunnel
   ▼
-ztunnel → productpage pod :9080      ← La app (sin sidecar, 1 contenedor)
+ztunnel → productpage pod :9080      ← App (no sidecar, 1 container)
   │
-  │  productpage llama a reviews:9080 y details:9080
+  │  productpage calls reviews:9080 and details:9080
   ▼
-ztunnel (intercepta salida)
+ztunnel (intercepts outbound)
   │  HBONE/mTLS
   ▼
-reviews-waypoint (Envoy L7)          ← Waypoint de reviews
+reviews-waypoint (Envoy L7)          ← Reviews waypoint
   │
   ▼
-ztunnel → reviews-v1/v2/v3 :9080    ← Una de las versiones
+ztunnel → reviews-v1/v2/v3 :9080    ← One of the versions
   │
-  │  reviews llama a ratings:9080
+  │  reviews calls ratings:9080
   ▼
 ztunnel → ratings-waypoint → ztunnel → ratings-v1 :9080
 ```
 
 ---
 
-## Comparación sidecar vs ambient
+## Sidecar vs Ambient Comparison
 
-| Concepto | Sidecar mode | Ambient mode |
+| Concept | Sidecar mode | Ambient mode |
 |---|---|---|
-| **mTLS** | Sidecar Envoy en cada pod | ztunnel (DaemonSet, 1 por nodo) |
-| **Identidad** | Cert en el sidecar | Cert en el ztunnel (SPIFFE) |
-| **L7 (HTTP)** | Sidecar Envoy en cada pod | Waypoint proxy (1 por servicio) |
-| **Inyección** | Label `istio-injection=enabled` en NS | Label `istio.io/dataplane-mode: ambient` en NS |
-| **Pods** | `2/2` (app + sidecar) | `1/1` (solo app) |
-| **Protocolo entre nodos** | mTLS directo (TCP) | HBONE (HTTP CONNECT sobre mTLS, puerto 15008) |
-| **Gateway ingress** | Sidecar injection en gateway pod | Gateway API con `dataplane-mode: none` |
-| **Activar L7 por servicio** | No posible (todo o nada) | `istio.io/use-waypoint` en el Service |
+| **mTLS** | Sidecar Envoy in each pod | ztunnel (DaemonSet, 1 per node) |
+| **Identity** | Certificate in the sidecar | Certificate in ztunnel (SPIFFE) |
+| **L7 (HTTP)** | Sidecar Envoy in each pod | Waypoint proxy (optional, per service) |
+| **Enrollment** | `istio-injection=enabled` on NS | `istio.io/dataplane-mode: ambient` on NS |
+| **Pod containers** | `2/2` (app + sidecar) | `1/1` (app only) |
+| **Inter-node protocol** | Direct mTLS (TCP) | HBONE (HTTP/2 CONNECT over mTLS, port 15008) |
+| **Ingress gateway** | Sidecar injection in gateway pod | Gateway API with `dataplane-mode: none` |
+| **L7 per service** | Not possible (all or nothing) | `istio.io/use-waypoint` on the Service |
+| **Istio upgrade impact** | Restart all application pods | Update ztunnel DaemonSet; no app restarts |
+| **Resource overhead** | N sidecars (1 per pod) | 1 ztunnel per node + waypoints as needed |
 
 ---
 
-## Ventajas clave de ambient
+## Key Advantages of Ambient Mode
 
-1. **L7 granular**: Solo los servicios que lo necesitan tienen waypoint. Si un servicio solo necesita mTLS, ztunnel se lo da sin waypoint.
+1. **Granular L7**: Only services that need it get a waypoint. Services that only need mTLS get it from ztunnel without any waypoint overhead.
 
-2. **Multi-cluster con HBONE**: El protocolo HBONE es el mismo entre pods locales y entre clústeres (east ↔ west) a través del east-west gateway. Los servicios con `istio.io/global: "true"` pueden descubrirse y comunicarse entre clústeres de forma transparente.
+2. **Infrastructure / Application separation**: Platform teams manage ztunnel (L4) independently from development teams managing waypoints (L7). Changes to either layer require no coordination and no pod restarts.
+   > **Demonstrated in**: UC1-T6 (Infrastructure Segregation)
 
-3. **Recursos reducidos**: En vez de N sidecars Envoy (uno por pod), hay 1 ztunnel compartido por nodo + waypoints por Service de K8s que lo necesite.
+3. **Reduced resources**: Instead of N Envoy sidecars (one per pod), there is 1 shared ztunnel per node + waypoints only for services that need L7.
 
-4. **Sin reinicio de pods para updates**: Actualizar Istio no requiere reiniciar los pods de la aplicación (el ztunnel se actualiza como DaemonSet).
+4. **No pod restarts for mesh updates**: Upgrading Istio does not require restarting application pods (ztunnel updates as a DaemonSet rolling update).
+
+5. **Control Plane Independence**: In Multi-Primary topology, each cluster has its own istiod. If one fails, the other continues operating with cached configuration.
+   > **Demonstrated in**: UC1-T5 (Control Plane Independence)
+
+6. **Zero-Trust by default**: mTLS is always on. Combined with `AuthorizationPolicy` and `PeerAuthentication`, the mesh provides defense-in-depth without application changes.
+   > **Demonstrated in**: UC2-T1 (Deny-All), UC2-T2 (Identity-Based Access), UC2-T4 (PeerAuthentication STRICT)
 
 ---
 
-## Nota operativa: reinicio de nodos
+## Multi-Cluster Topology
 
-Tras un reinicio de nodo, los pods se recrean pero las reglas de redirección del CNI de Istio ambient pueden no restablecerse correctamente. Si el tráfico HBONE falla con timeouts (`connection failed: deadline has elapsed` en los logs de ztunnel), es necesario hacer `rollout restart` de los deployments para que el CNI reconfigure las reglas de red en los nuevos pods.
+This PoC uses a **Multi-Primary** topology:
+
+- **Two OCP 4.20 clusters** (EAST and WEST), each with its own istiod
+- **One ACM hub** for centralized management and Kiali (OSSMC)
+- **Shared trust domain** (`cluster.local`) with a shared Root CA and per-cluster Intermediate CAs
+- **Remote secrets** allow each istiod to discover the other cluster's endpoints
+
+### What works
+
+- **Control plane federation**: service discovery, remote secrets, shared trust
+- **Independent control planes**: one istiod can fail without affecting the other cluster's data plane
+- **Unified observability**: Kiali on ACM shows both clusters in a single graph
+
+---
+
+## Istio API Reference (OSSM 3.2)
+
+| API Resource | Layer | Status in OSSM 3.2 | Used in |
+|---|---|---|---|
+| `AuthorizationPolicy` | L4/L7 security | GA (Stable) | UC1-T6, UC2-T1, UC2-T2 |
+| `PeerAuthentication` | mTLS enforcement | GA (Stable) | UC2-T4 |
+| `Telemetry` | Observability config | GA (Stable) | UC1-T6, UC13 |
+| `Gateway` (K8s API) | Ingress / Waypoint | GA (Stable) | UC12 |
+| `HTTPRoute` (K8s API) | L7 routing | GA (Stable) | UC12 |
+| `VirtualService` | L7 routing (legacy) | TP (Alpha) | Not recommended for ambient |
+
+> **Note**: `VirtualService` was tested but does not function correctly with waypoint proxies in ambient mode. Use `HTTPRoute` (Gateway API) instead for L7 traffic management.
+
+---
+
+## Operational Notes
+
+### Post-restart recovery
+
+After a node or cluster restart, pods are recreated but the Istio CNI ambient network redirection rules may not be re-established correctly. If HBONE traffic fails with timeouts (`connection failed: deadline has elapsed` in ztunnel logs), a `rollout restart` of the affected deployments forces the CNI to reconfigure network rules on the new pods.
+
+The `morning-check.sh` script automates this recovery for the PoC sandbox environment.
+
+### Traffic generation for Kiali
+
+Two scripts are available:
+
+| Script | Purpose | Use when |
+|---|---|---|
+| `generate-traffic.sh` | Simple continuous traffic to bookinfo (EAST, WEST) and bookinfo-external | During most use case demos — keeps Kiali graphs populated |
+| `generate-traffic-realistic.sh` | Advanced mixed traffic with concurrency, jitter, bursts, and varied paths | Stress testing or realistic traffic pattern simulation |
+
+For most use cases, run `generate-traffic.sh` in a separate terminal before starting the demo. **Exception**: UC12 (Blue/Green) has its own embedded traffic generation to target specific versioned endpoints.
+
+---
+
+## Use Case Index
+
+| ID | Title | Scope |
+|---|---|---|
+| UC1-T1 | Baseline OpenShift Environments | Infrastructure |
+| UC1-T2 | Deploying OSSM 3.2 in Ambient Mode | Mesh deployment |
+| UC1-T3 | Multi-Primary Federation & Discovery | Control plane |
+| UC1-T5 | Control Plane Independence | Resilience |
+| UC1-T6 | Infrastructure Segregation (L4 vs Policy) | Architecture |
+| UC2-T1 | The "Lockdown" (Deny-All Everywhere) | Security |
+| UC2-T2 | ServiceAccount-Based Enablement | Identity / RBAC |
+| UC2-T3 | Unified Trust & mTLS Verification | Trust / PKI |
+| UC2-T4 | mTLS Enforcement (PeerAuthentication STRICT) | Security |
+| UC12 | Blue/Green Deployment with Gateway API | Traffic management |
+| UC13 | Local-First Traffic Awareness | Routing / observability |

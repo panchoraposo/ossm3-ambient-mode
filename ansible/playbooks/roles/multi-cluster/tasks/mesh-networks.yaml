@@ -12,29 +12,35 @@
     eastwest_https_svc_name: "istio-eastwestgateway-https"
     eastwest_port: 15008
   tasks:
-    - name: Label istio-system namespace with default network on East
-      kubernetes.core.k8s:
-        context: "{{ ctx_east }}"
-        state: patched
-        api_version: v1
-        kind: Namespace
-        name: "{{ istio_ns }}"
-        definition:
-          metadata:
-            labels:
-              topology.istio.io/network: "network1"
-
-    - name: Label istio-system namespace with default network on West
-      kubernetes.core.k8s:
-        context: "{{ ctx_west }}"
-        state: patched
-        api_version: v1
-        kind: Namespace
-        name: "{{ istio_ns }}"
-        definition:
-          metadata:
-            labels:
-              topology.istio.io/network: "network2"
+    # ── Disabled: multi-network topology labels ────────────────────────
+    # In OSSM 3.2 (Istio 1.27) ambient mode, these labels cause ztunnel
+    # to prefix VIPs with "network1/" which prevents waypoint proxies
+    # from intercepting L7 traffic. Commented out to enable waypoints.
+    # To restore: uncomment and re-run the playbook.
+    #
+    # - name: Label istio-system namespace with default network on East
+    #   kubernetes.core.k8s:
+    #     context: "{{ ctx_east }}"
+    #     state: patched
+    #     api_version: v1
+    #     kind: Namespace
+    #     name: "{{ istio_ns }}"
+    #     definition:
+    #       metadata:
+    #         labels:
+    #           topology.istio.io/network: "network1"
+    #
+    # - name: Label istio-system namespace with default network on West
+    #   kubernetes.core.k8s:
+    #     context: "{{ ctx_west }}"
+    #     state: patched
+    #     api_version: v1
+    #     kind: Namespace
+    #     name: "{{ istio_ns }}"
+    #     definition:
+    #       metadata:
+    #         labels:
+    #           topology.istio.io/network: "network2"
 
     - name: Ensure east-west Gateway on East (HBONE)
       kubernetes.core.k8s:
@@ -190,92 +196,97 @@
         west_gw_addr: "{{ west_route.resources[0].spec.host }}"
         eastwest_public_port: 443
 
-    - name: Patch global.meshNetworks in East (Istio CR)
-      kubernetes.core.k8s:
-        context: "{{ ctx_east }}"
-        state: patched
-        api_version: sailoperator.io/v1
-        kind: Istio
-        name: default
-        namespace: "{{ istio_ns }}"
-        definition:
-          spec:
-            values:
-              global:
-                meshNetworks:
-                  network1:
-                    endpoints:
-                    - fromRegistry: east
-                    gateways:
-                    - address: "{{ east_gw_addr }}"
-                      port: "{{ eastwest_public_port }}"
-                  network2:
-                    endpoints:
-                    - fromRegistry: west
-                    gateways:
-                    - address: "{{ west_gw_addr }}"
-                      port: "{{ eastwest_public_port }}"
-
-    - name: Patch global.meshNetworks in West (Istio CR)
-      kubernetes.core.k8s:
-        context: "{{ ctx_west }}"
-        state: patched
-        api_version: sailoperator.io/v1
-        kind: Istio
-        name: default
-        namespace: "{{ istio_ns }}"
-        definition:
-          spec:
-            values:
-              global:
-                meshNetworks:
-                  network1:
-                    endpoints:
-                    - fromRegistry: east
-                    gateways:
-                    - address: "{{ east_gw_addr }}"
-                      port: "{{ eastwest_public_port }}"
-                  network2:
-                    endpoints:
-                    - fromRegistry: west
-                    gateways:
-                    - address: "{{ west_gw_addr }}"
-                      port: "{{ eastwest_public_port }}"
-
-    - name: Remove stray meshNetworks key "networks" in East (if present)
-      shell: >
-        oc --context {{ ctx_east }} patch istio default -n {{ istio_ns }}
-        --type='json'
-        -p='[{"op":"remove","path":"/spec/values/global/meshNetworks/networks"}]'
-      register: rm_networks_east
-      failed_when: false
-      changed_when: rm_networks_east.rc == 0
-
-    - name: Remove stray meshNetworks key "networks" in West (if present)
-      shell: >
-        oc --context {{ ctx_west }} patch istio default -n {{ istio_ns }}
-        --type='json'
-        -p='[{"op":"remove","path":"/spec/values/global/meshNetworks/networks"}]'
-      register: rm_networks_west
-      failed_when: false
-      changed_when: rm_networks_west.rc == 0
-
-    - name: Restart istiod on East (pick up meshNetworks)
-      kubernetes.core.k8s:
-        context: "{{ ctx_east }}"
-        state: absent
-        api_version: v1
-        kind: Pod
-        namespace: "{{ istio_ns }}"
-        label_selectors:
-          - app=istiod
-
-    - name: Restart istiod on West (pick up meshNetworks)
-      kubernetes.core.k8s:
-        context: "{{ ctx_west }}"
-        state: absent
-        api_version: v1
-        kind: Pod
-        namespace: "{{ istio_ns }}"
-        label_selectors:
-          - app=istiod
+    # ── Disabled: meshNetworks + associated restarts ────────────────────
+    # Same reason as network labels above: meshNetworks config causes
+    # ztunnel VIP prefix issue in OSSM 3.2 ambient mode.
+    # To restore: uncomment and re-run the playbook.
+    #
+    # - name: Patch global.meshNetworks in East (Istio CR)
+    #   kubernetes.core.k8s:
+    #     context: "{{ ctx_east }}"
+    #     state: patched
+    #     api_version: sailoperator.io/v1
+    #     kind: Istio
+    #     name: default
+    #     namespace: "{{ istio_ns }}"
+    #     definition:
+    #       spec:
+    #         values:
+    #           global:
+    #             meshNetworks:
+    #               network1:
+    #                 endpoints:
+    #                 - fromRegistry: east
+    #                 gateways:
+    #                 - address: "{{ east_gw_addr }}"
+    #                   port: "{{ eastwest_public_port }}"
+    #               network2:
+    #                 endpoints:
+    #                 - fromRegistry: west
+    #                 gateways:
+    #                 - address: "{{ west_gw_addr }}"
+    #                   port: "{{ eastwest_public_port }}"
+    #
+    # - name: Patch global.meshNetworks in West (Istio CR)
+    #   kubernetes.core.k8s:
+    #     context: "{{ ctx_west }}"
+    #     state: patched
+    #     api_version: sailoperator.io/v1
+    #     kind: Istio
+    #     name: default
+    #     namespace: "{{ istio_ns }}"
+    #     definition:
+    #       spec:
+    #         values:
+    #           global:
+    #             meshNetworks:
+    #               network1:
+    #                 endpoints:
+    #                 - fromRegistry: east
+    #                 gateways:
+    #                 - address: "{{ east_gw_addr }}"
+    #                   port: "{{ eastwest_public_port }}"
+    #               network2:
+    #                 endpoints:
+    #                 - fromRegistry: west
+    #                 gateways:
+    #                 - address: "{{ west_gw_addr }}"
+    #                   port: "{{ eastwest_public_port }}"
+    #
+    # - name: Remove stray meshNetworks key "networks" in East (if present)
+    #   shell: >
+    #     oc --context {{ ctx_east }} patch istio default -n {{ istio_ns }}
+    #     --type='json'
+    #     -p='[{"op":"remove","path":"/spec/values/global/meshNetworks/networks"}]'
+    #   register: rm_networks_east
+    #   failed_when: false
+    #   changed_when: rm_networks_east.rc == 0
+    #
+    # - name: Remove stray meshNetworks key "networks" in West (if present)
+    #   shell: >
+    #     oc --context {{ ctx_west }} patch istio default -n {{ istio_ns }}
+    #     --type='json'
+    #     -p='[{"op":"remove","path":"/spec/values/global/meshNetworks/networks"}]'
+    #   register: rm_networks_west
+    #   failed_when: false
+    #   changed_when: rm_networks_west.rc == 0
+    #
+    # - name: Restart istiod on East (pick up meshNetworks)
+    #   kubernetes.core.k8s:
+    #     context: "{{ ctx_east }}"
+    #     state: absent
+    #     api_version: v1
+    #     kind: Pod
+    #     namespace: "{{ istio_ns }}"
+    #     label_selectors:
+    #       - app=istiod
+    #
+    # - name: Restart istiod on West (pick up meshNetworks)
+    #   kubernetes.core.k8s:
+    #     context: "{{ ctx_west }}"
+    #     state: absent
+    #     api_version: v1
+    #     kind: Pod
+    #     namespace: "{{ istio_ns }}"
+    #     label_selectors:
+    #       - app=istiod

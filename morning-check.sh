@@ -19,6 +19,7 @@ FAIL="${RED}✘${RESET}"
 
 EAST_ROUTE="bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com"
 WEST_ROUTE="bookinfo.apps.cluster-7rt9h.7rt9h.sandbox1900.opentlc.com"
+EAST_EXT_ROUTE="bookinfo-external.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com"
 
 ERRORS=0
 
@@ -57,8 +58,11 @@ step "Restarting bookinfo pods (EAST & WEST)"
 for ctx in east west; do
   CTX_UPPER=$(echo "$ctx" | tr '[:lower:]' '[:upper:]')
   oc --context "$ctx" -n bookinfo rollout restart deployment &>/dev/null
-  echo -e "  ${PASS} ${CTX_UPPER} rollout restart triggered"
+  echo -e "  ${PASS} ${CTX_UPPER} bookinfo rollout restart triggered"
 done
+
+oc --context east -n bookinfo-external rollout restart deployment &>/dev/null
+echo -e "  ${PASS} EAST bookinfo-external rollout restart triggered"
 
 # ── 3. Wait for pods ─────────────────────────────────────────────────
 
@@ -70,16 +74,30 @@ for ctx in east west; do
   ALL_OK=true
   for dep in $DEPLOYMENTS; do
     if ! oc --context "$ctx" -n bookinfo rollout status deployment/"$dep" --timeout=120s &>/dev/null; then
-      echo -e "  ${FAIL} ${CTX_UPPER} ${dep} did not become Ready"
+      echo -e "  ${FAIL} ${CTX_UPPER} bookinfo/${dep} did not become Ready"
       ALL_OK=false
       ERRORS=$((ERRORS + 1))
     fi
   done
   if $ALL_OK; then
     POD_COUNT=$(oc --context "$ctx" get pods -n bookinfo --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')
-    echo -e "  ${PASS} ${CTX_UPPER} all deployments ready (${POD_COUNT} pods running)"
+    echo -e "  ${PASS} ${CTX_UPPER} bookinfo all deployments ready (${POD_COUNT} pods running)"
   fi
 done
+
+EXT_DEPLOYMENTS=$(oc --context east get deployments -n bookinfo-external -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+EXT_OK=true
+for dep in $EXT_DEPLOYMENTS; do
+  if ! oc --context east -n bookinfo-external rollout status deployment/"$dep" --timeout=120s &>/dev/null; then
+    echo -e "  ${FAIL} EAST bookinfo-external/${dep} did not become Ready"
+    EXT_OK=false
+    ERRORS=$((ERRORS + 1))
+  fi
+done
+if $EXT_OK && [[ -n "$EXT_DEPLOYMENTS" ]]; then
+  EXT_POD_COUNT=$(oc --context east get pods -n bookinfo-external --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')
+  echo -e "  ${PASS} EAST bookinfo-external ready (${EXT_POD_COUNT} pods running)"
+fi
 
 # ── 4. Test external HTTP access ─────────────────────────────────────
 
@@ -87,7 +105,7 @@ step "Testing external HTTP access"
 
 sleep 5
 
-for entry in "east|${EAST_ROUTE}" "west|${WEST_ROUTE}"; do
+for entry in "east|${EAST_ROUTE}" "west|${WEST_ROUTE}" "east|${EAST_EXT_ROUTE}"; do
   ctx="${entry%%|*}"
   route="${entry##*|}"
   CTX_UPPER=$(echo "$ctx" | tr '[:lower:]' '[:upper:]')
