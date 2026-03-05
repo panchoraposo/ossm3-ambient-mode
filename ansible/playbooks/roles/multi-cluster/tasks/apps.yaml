@@ -19,100 +19,9 @@
               istio-discovery: enabled
               openshift.io/user-monitoring: "true"
 
-    - name: Deploy per-service waypoints (productpage/reviews/ratings/details)
-      kubernetes.core.k8s:
-        context: "{{ k8s_context }}"
-        state: present
-        definition: "{{ item }}"
-      loop:
-        - apiVersion: gateway.networking.k8s.io/v1
-          kind: Gateway
-          metadata:
-            name: productpage-waypoint
-            namespace: "{{ app_ns }}"
-            labels:
-              istio.io/waypoint-for: all
-          spec:
-            gatewayClassName: istio-waypoint
-            listeners:
-            - name: mesh
-              port: 15008
-              protocol: HBONE
-        - apiVersion: gateway.networking.k8s.io/v1
-          kind: Gateway
-          metadata:
-            name: reviews-waypoint
-            namespace: "{{ app_ns }}"
-            labels:
-              istio.io/waypoint-for: all
-          spec:
-            gatewayClassName: istio-waypoint
-            listeners:
-            - name: mesh
-              port: 15008
-              protocol: HBONE
-        - apiVersion: gateway.networking.k8s.io/v1
-          kind: Gateway
-          metadata:
-            name: ratings-waypoint
-            namespace: "{{ app_ns }}"
-            labels:
-              istio.io/waypoint-for: all
-          spec:
-            gatewayClassName: istio-waypoint
-            listeners:
-            - name: mesh
-              port: 15008
-              protocol: HBONE
-        - apiVersion: gateway.networking.k8s.io/v1
-          kind: Gateway
-          metadata:
-            name: details-waypoint
-            namespace: "{{ app_ns }}"
-            labels:
-              istio.io/waypoint-for: all
-          spec:
-            gatewayClassName: istio-waypoint
-            listeners:
-            - name: mesh
-              port: 15008
-              protocol: HBONE
-
-    - name: Remove namespace-wide waypoint enrollment (use per-service instead)
-      kubernetes.core.k8s:
-        context: "{{ k8s_context }}"
-        state: patched
-        kind: Namespace
-        name: "{{ app_ns }}"
-        definition:
-          metadata:
-            labels:
-              istio.io/use-waypoint: null
-              openshift.io/user-monitoring: "true"
-
-    - name: Create PodMonitor for waypoints (metrics for Kiali graph)
-      kubernetes.core.k8s:
-        context: "{{ k8s_context }}"
-        state: present
-        definition:
-          apiVersion: monitoring.coreos.com/v1
-          kind: PodMonitor
-          metadata:
-            name: istio-waypoints-monitor
-            namespace: "{{ app_ns }}"
-            labels:
-              k8s-app: waypoint-monitor
-              openshift.io/user-monitoring: "true"
-          spec:
-            selector:
-              matchExpressions:
-                - key: gateway.networking.k8s.io/gateway-name
-                  operator: In
-                  values: ["productpage-waypoint","reviews-waypoint","ratings-waypoint","details-waypoint"]
-            podMetricsEndpoints:
-            - path: /stats/prometheus
-              port: http-envoy-prom
-              interval: 30s
+    # Waypoints are NOT deployed at baseline.
+    # Each use case script deploys/removes waypoints as needed (L7 on demand).
+    # This keeps the baseline lightweight (L4 only via ztunnel).
 
     - name: Deploy Full Bookinfo Stack
       kubernetes.core.k8s:
@@ -144,39 +53,23 @@
         - reviews-v3
         - ratings-v1
 
-    - name: Label Bookinfo services (waypoint + global)
+    - name: Label Bookinfo services (global discovery)
       kubernetes.core.k8s:
         context: "{{ k8s_context }}"
         state: patched
         api_version: v1
         kind: Service
         namespace: "{{ app_ns }}"
-        name: "{{ item.name }}"
+        name: "{{ item }}"
         definition:
           metadata:
             labels:
-              istio.io/use-waypoint: "{{ item.waypoint }}"
               istio.io/global: "true"
       loop:
-        - { name: productpage, waypoint: "productpage-waypoint" }
-        - { name: reviews, waypoint: "reviews-waypoint" }
-        - { name: ratings, waypoint: "ratings-waypoint" }
-        - { name: details, waypoint: "details-waypoint" }
-
-    - name: Enroll productpage workload (deployment) to use its per-service waypoint
-      kubernetes.core.k8s:
-        context: "{{ k8s_context }}"
-        state: patched
-        api_version: apps/v1
-        kind: Deployment
-        namespace: "{{ app_ns }}"
-        name: productpage-v1
-        definition:
-          spec:
-            template:
-              metadata:
-                labels:
-                  istio.io/use-waypoint: productpage-waypoint
+        - productpage
+        - reviews
+        - ratings
+        - details
 
     - name: Ensure backends are enrolled in ambient on WEST (remove disabling template flags)
       when: inventory_hostname == 'west'
