@@ -179,9 +179,15 @@ echo -e "${BOLD}╚════════════════════�
 
 check_trust_domain
 check_multicluster_config
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_remote_secrets
 check_network_topology
 check_eastwest_gateways
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_service_discovery
 check_kiali
+read -rp "  ⏎ Press ENTER to continue..." _
+
 summary

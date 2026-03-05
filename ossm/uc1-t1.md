@@ -88,3 +88,17 @@ Expected: `istiod` running in both clusters, `ztunnel` DaemonSet running on each
 | istiod | Running | Running | N/A |
 | ztunnel | Running | Running | N/A |
 | Managed Clusters | — | — | EAST + WEST available |
+
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| OSSM 3 Operator | Installs and manages Istio lifecycle | Yes — mesh operator |
+| Istio CR (Healthy) | Declares the mesh control plane | Yes — control plane config |
+| istiod | Control plane, manages mesh config and certs | Yes — control plane |
+| ztunnel DaemonSet | L4 data plane, mTLS, per node | Yes — L4 data plane |
+| ACM | Centralized multi-cluster management | Kubernetes (support) |
+
+## Key Takeaway
+
+The baseline environment provides two independent OCP 4.20 clusters with OSSM 3.2 operator installed and a healthy Istio control plane. ACM acts as the centralized management hub. This is the foundation for all subsequent use cases.

@@ -188,8 +188,16 @@ check_acm() {
 summary() {
   header "BASELINE SUMMARY"
   echo ""
-  echo -e "  Environment ready for Service Mesh multi-cluster testing."
+  echo -e "  Environment ready for Service Mesh demo."
   echo -e "  Clusters: EAST, WEST (mesh), ACM (hub)"
+  echo ""
+  echo -e "  ${BOLD}OpenShift Consoles (verify operators visually):${RESET}"
+  for ctx in "${CONTEXTS[@]}"; do
+    console_url=$(oc --context "$ctx" get route console -n openshift-console -o jsonpath='{.spec.host}' 2>/dev/null)
+    if [[ -n "$console_url" ]]; then
+      echo -e "    $(echo "$ctx" | tr '[:lower:]' '[:upper:]'): https://${console_url}"
+    fi
+  done
   echo ""
 }
 
@@ -200,9 +208,19 @@ echo -e "${BOLD}║   UC1-T1: Baseline OpenShift Environments Verification     �
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
 
 check_cluster_access
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_nodes
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_ossm_operator
 check_istio_cr
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_mesh_pods
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_acm
+read -rp "  ⏎ Press ENTER to continue..." _
+
 summary

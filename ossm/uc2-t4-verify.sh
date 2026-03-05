@@ -88,6 +88,7 @@ echo -e "  ${PASS} Pod ${BOLD}${TEST_POD}${RESET} running in non-mesh namespace"
 header "2. Test Default Mode (PERMISSIVE)"
 test_from_outside "default (no PeerAuthentication)" "true"
 test_from_mesh "default"
+read -rp "  ⏎ Press ENTER to apply STRICT mode..." _
 
 # Step 3: Apply STRICT
 header "3. Apply PeerAuthentication STRICT"

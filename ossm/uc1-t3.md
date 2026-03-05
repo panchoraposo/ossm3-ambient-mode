@@ -109,6 +109,17 @@ https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/
 | Services discoverable | details, productpage, ratings, reviews | details, productpage, ratings, reviews |
 | Kiali graph | Shows both clusters | Shows both clusters |
 
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| Shared trust domain (`cluster.local`) | Unified identity across clusters | Yes — mTLS / SPIFFE |
+| Remote secrets | Cross-cluster API access for istiod | Yes — control plane federation |
+| istiod (per cluster) | Discovers remote endpoints, pushes config | Yes — control plane |
+| East-west gateways | Cross-network connectivity (HBONE) | Yes — data plane |
+| Kiali (ACM) | Unified visualization of both clusters | Yes — mesh observability |
+| `istio.io/global=true` label | Marks services for cross-cluster discovery | Yes — service discovery |
+
 ## Key Takeaway
 
 The Multi-Primary topology with shared trust domain (`cluster.local`) enables automatic service discovery without manual DNS or routing configuration. Each istiod instance uses remote secrets to query the other cluster's API server, discovering endpoints and pushing them to the local data plane. Kiali provides a unified view of both clusters from the ACM hub.

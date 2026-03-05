@@ -195,8 +195,14 @@ echo -e "${BOLD}╚════════════════════�
 
 check_ambient_profile
 check_istiocni
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_ztunnel
 check_istiod
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_namespace_label
 check_no_sidecar
+read -rp "  ⏎ Press ENTER to continue..." _
+
 summary

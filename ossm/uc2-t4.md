@@ -7,8 +7,9 @@ Apply a `PeerAuthentication` policy in STRICT mode to the root namespace and dem
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed
-- `generate-traffic.sh` running (optional)
-- Kiali open (OSSMC via ACM console)
+- `generate-traffic.sh` running for Kiali visualization
+- Kiali open (OSSMC via ACM console):
+  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 
 ## Quick Run
 
@@ -106,6 +107,16 @@ Expected: HTTP 200.
 | Default (PERMISSIVE) | **HTTP 200** (accepted) | HTTP 200 |
 | STRICT applied | **HTTP 000** (rejected) | HTTP 200 |
 | After cleanup | N/A (pod deleted) | HTTP 200 |
+
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| PeerAuthentication (STRICT) | Rejects non-mTLS connections | Yes — mesh security |
+| ztunnel | Enforces mTLS, drops plaintext from non-mesh pods | Yes — L4 data plane |
+| istiod | Pushes PeerAuthentication to all ztunnels | Yes — control plane |
+| Root namespace scope | STRICT applies mesh-wide from `istio-system` | Yes — mesh config |
+| Non-mesh test pod | Proves plaintext is rejected | Kubernetes (test tool) |
 
 ## Key Takeaway
 

@@ -1,5 +1,7 @@
 # UC2-T2: ServiceAccount-Based Enablement (Cross-Namespace Identity)
 
+> **Alcance**: El caso de uso original plantea contexto multi-cluster (EAST→WEST). En OSSM 3.2 (Istio 1.27) ambient mode, el data plane cross-cluster no soporta waypoints, por lo que aquí se demuestra la misma funcionalidad single-cluster. La mecánica SPIFFE es idéntica cross-namespace y cross-cluster, ya que la identidad es `spiffe://cluster.local/ns/<ns>/sa/<sa>` independientemente del cluster de origen.
+
 ## Objective
 
 Demonstrate that the mesh enforces access control based on SPIFFE identities (ServiceAccount-based). A service in a different namespace can only access `reviews` in `bookinfo` if its ServiceAccount is explicitly authorized.
@@ -12,7 +14,8 @@ Demonstrate that the mesh enforces access control based on SPIFFE identities (Se
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed
-- Namespace `bookinfo-external` created and enrolled in ambient mode (done by the verify script)
+- Namespace `bookinfo-external` deployed and enrolled in ambient mode
+- `generate-traffic.sh` running for Kiali visualization
 - Kiali open (OSSMC via ACM console):
   https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 
@@ -24,135 +27,20 @@ Demonstrate that the mesh enforces access control based on SPIFFE identities (Se
 
 ## Test Flow
 
-### Phase 1: Setup `bookinfo-external`
+### Phase 1: Verify `bookinfo-external` is available
 
-Create namespace with ambient mode, deploy productpage with `SERVICES_DOMAIN` pointing to `bookinfo`:
-
-```bash
-oc --context east create namespace bookinfo-external
-oc --context east label namespace bookinfo-external istio.io/dataplane-mode=ambient
-```
-
-Deploy productpage:
+The `bookinfo-external` namespace is deployed by the Ansible playbook. It contains a copy of `productpage` with `SERVICES_DOMAIN=bookinfo.svc.cluster.local`, which calls `reviews`, `details`, and `ratings` in the `bookinfo` namespace. It uses a different ServiceAccount (`bookinfo-external-productpage`), giving it a distinct SPIFFE identity.
 
 ```bash
-oc --context east apply -f - <<EOF
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: bookinfo-external-productpage
-  namespace: bookinfo-external
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: productpage
-  namespace: bookinfo-external
-  labels:
-    app: productpage
-spec:
-  ports:
-  - port: 9080
-    name: http
-  selector:
-    app: productpage
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: productpage-v1
-  namespace: bookinfo-external
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: productpage
-      version: v1
-  template:
-    metadata:
-      labels:
-        app: productpage
-        version: v1
-    spec:
-      serviceAccountName: bookinfo-external-productpage
-      containers:
-      - name: productpage
-        image: quay.io/sail-dev/examples-bookinfo-productpage-v1:1.20.3
-        ports:
-        - containerPort: 9080
-        env:
-        - name: SERVICES_DOMAIN
-          value: "bookinfo.svc.cluster.local"
-        volumeMounts:
-        - mountPath: /tmp
-          name: tmp
-      volumes:
-      - emptyDir: {}
-        name: tmp
-EOF
+oc --context east get namespace bookinfo-external --show-labels
+oc --context east get pods -n bookinfo-external
+oc --context east get route -n bookinfo-external
 ```
 
-Create Gateway + HTTPRoute + Route:
-
-```bash
-oc --context east apply -f - <<EOF
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: bookinfo-external-gateway
-  namespace: bookinfo-external
-  annotations:
-    networking.istio.io/service-type: ClusterIP
-spec:
-  gatewayClassName: istio
-  listeners:
-  - name: http
-    port: 80
-    protocol: HTTP
-    allowedRoutes:
-      namespaces:
-        from: Same
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: bookinfo-external
-  namespace: bookinfo-external
-spec:
-  parentRefs:
-  - name: bookinfo-external-gateway
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /productpage
-    - path:
-        type: PathPrefix
-        value: /static
-    - path:
-        type: PathPrefix
-        value: /login
-    - path:
-        type: PathPrefix
-        value: /logout
-    backendRefs:
-    - name: productpage
-      port: 9080
----
-apiVersion: route.openshift.io/v1
-kind: Route
-metadata:
-  name: bookinfo-external-gateway
-  namespace: bookinfo-external
-spec:
-  host: bookinfo-external.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com
-  port:
-    targetPort: 80
-  to:
-    kind: Service
-    name: bookinfo-external-gateway-istio
-EOF
-```
+Verify:
+- Namespace has `istio.io/dataplane-mode=ambient`
+- productpage pod is `Running`
+- Route exposes `bookinfo-external.apps.<cluster-domain>`
 
 ### Phase 2: Verify both Routes work (no policy)
 
@@ -173,9 +61,10 @@ metadata:
   name: reviews-deny-external
   namespace: bookinfo
 spec:
-  selector:
-    matchLabels:
-      app: reviews
+  targetRefs:
+  - kind: Service
+    group: ""
+    name: reviews
   action: DENY
   rules:
   - from:
@@ -184,6 +73,8 @@ spec:
         - bookinfo-external
 EOF
 ```
+
+> **Note:** In ambient mode, `targetRefs` (pointing to a Service) must be used instead of `selector.matchLabels`. The waypoint proxy enforces the policy on behalf of the target service.
 
 Expected:
 - **Original bookinfo**: HTTP 200 — Book Details + Book Reviews (works)
@@ -200,9 +91,10 @@ metadata:
   name: reviews-allow-by-identity
   namespace: bookinfo
 spec:
-  selector:
-    matchLabels:
-      app: reviews
+  targetRefs:
+  - kind: Service
+    group: ""
+    name: reviews
   action: ALLOW
   rules:
   - from:
@@ -229,6 +121,17 @@ oc --context east delete authorizationpolicy reviews-allow-by-identity -n bookin
 | DENY external namespace | Details + Reviews OK | Details OK, **Reviews DENIED** |
 | ALLOW both SAs | Details + Reviews OK | Details + Reviews OK |
 | After cleanup | Details + Reviews OK | Details + Reviews OK |
+
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| SPIFFE identity per SA | Cryptographic workload identity | Yes — mTLS / identity |
+| AuthorizationPolicy (DENY) | Blocks traffic by source namespace | Yes — mesh security |
+| AuthorizationPolicy (ALLOW) | Allows traffic by SPIFFE principal | Yes — mesh security |
+| ztunnel | Enforces policy at L4 per identity | Yes — L4 data plane |
+| istiod | Issues certificates, pushes policies | Yes — control plane |
+| Cross-namespace `SERVICES_DOMAIN` | App resolves services in another namespace | Kubernetes (DNS) |
 
 ## Key Takeaway
 

@@ -146,8 +146,12 @@ echo -e "${BOLD}╚════════════════════�
 
 check_root_ca
 check_intermediate_cas
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_mtls_default
 check_spiffe_identities
+read -rp "  ⏎ Press ENTER to continue..." _
+
 check_hbone_encryption
 
 header "TRUST & mTLS SUMMARY"

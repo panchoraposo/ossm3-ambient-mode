@@ -13,8 +13,9 @@ Prove that the Multi-Primary topology eliminates single point of failure risk. S
 ## Prerequisites
 
 - Both clusters (EAST and WEST) running with bookinfo deployed
-- `generate-traffic.sh` running to produce continuous traffic
-- Kiali open on WEST cluster
+- `generate-traffic.sh` running to produce continuous traffic for Kiali visualization
+- Kiali open (OSSMC via ACM console):
+  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 
 ## Steps
 
@@ -74,6 +75,16 @@ oc --context east get pods -n istio-system -l app=istiod
 | Restored    | Running     | 200          | 200          |
 
 
-## Why it works
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| istiod (per cluster) | Independent control plane, pushes config to ztunnel | Yes — control plane |
+| ztunnel | Continues routing and mTLS with cached config | Yes — L4 data plane |
+| Waypoint proxies | Continue L7 policies with cached config | Yes — L7 data plane |
+| Multi-Primary topology | Each cluster operates independently | Yes — mesh architecture |
+| Kiali | Shows traffic still flowing during failure | Yes — mesh observability |
+
+## Key Takeaway
 
 In ambient mode, the data plane (ztunnel + waypoint proxies) operates independently from the control plane (istiod). Once configured, ztunnel and waypoints keep their last-known configuration in memory. Losing istiod only means no new configuration updates — existing traffic routing, mTLS, and policies remain active.

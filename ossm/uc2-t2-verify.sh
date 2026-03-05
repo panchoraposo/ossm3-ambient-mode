@@ -81,145 +81,38 @@ echo -e "${BOLD}║  UC2-T2: ServiceAccount-Based Enablement                   �
 echo -e "${BOLD}║  Cross-Namespace Identity Authorization                    ║${RESET}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
 
-# ── Phase 1: Setup bookinfo-external ─────────────────────────────────────
-header "1. Setup bookinfo-external namespace"
+# ── Phase 1: Verify bookinfo-external is available ───────────────────────
+header "1. Verify bookinfo-external namespace"
 
-if oc --context east get namespace bookinfo-external &>/dev/null; then
-  echo -e "  ${PASS} Namespace ${BOLD}bookinfo-external${RESET} already exists"
-else
-  oc --context east create namespace bookinfo-external &>/dev/null
-  echo -e "  ${PASS} Namespace ${BOLD}bookinfo-external${RESET} created"
+if ! oc --context east get namespace bookinfo-external &>/dev/null; then
+  echo -e "  ${FAIL} Namespace ${BOLD}bookinfo-external${RESET} does not exist"
+  echo -e "       Run the Ansible playbook to deploy it first."
+  exit 1
 fi
+echo -e "  ${PASS} Namespace ${BOLD}bookinfo-external${RESET} exists"
 
 ambient_label=$(oc --context east get namespace bookinfo-external -o jsonpath='{.metadata.labels.istio\.io/dataplane-mode}' 2>/dev/null)
-if [[ "$ambient_label" != "ambient" ]]; then
-  oc --context east label namespace bookinfo-external istio.io/dataplane-mode=ambient --overwrite &>/dev/null
+if [[ "$ambient_label" == "ambient" ]]; then
+  echo -e "  ${PASS} Ambient mode: ${GREEN}enabled${RESET}"
+else
+  echo -e "  ${FAIL} Ambient mode: ${RED}not enabled${RESET} (label: ${ambient_label:-none})"
+  exit 1
 fi
-echo -e "  ${PASS} Ambient mode: ${GREEN}enabled${RESET}"
 
-section "Deploy productpage in bookinfo-external"
-oc --context east apply -f - <<'RESOURCES' &>/dev/null
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: bookinfo-external-productpage
-  namespace: bookinfo-external
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: productpage
-  namespace: bookinfo-external
-  labels:
-    app: productpage
-spec:
-  ports:
-  - port: 9080
-    name: http
-    targetPort: 9080
-  selector:
-    app: productpage
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: productpage-v1
-  namespace: bookinfo-external
-  labels:
-    app: productpage
-    version: v1
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: productpage
-      version: v1
-  template:
-    metadata:
-      labels:
-        app: productpage
-        version: v1
-    spec:
-      serviceAccountName: bookinfo-external-productpage
-      containers:
-      - name: productpage
-        image: quay.io/sail-dev/examples-bookinfo-productpage-v1:1.20.3
-        ports:
-        - containerPort: 9080
-        env:
-        - name: SERVICES_DOMAIN
-          value: "bookinfo.svc.cluster.local"
-        volumeMounts:
-        - mountPath: /tmp
-          name: tmp
-      volumes:
-      - emptyDir: {}
-        name: tmp
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: bookinfo-external-gateway
-  namespace: bookinfo-external
-  annotations:
-    networking.istio.io/service-type: ClusterIP
-spec:
-  gatewayClassName: istio
-  listeners:
-  - name: http
-    port: 80
-    protocol: HTTP
-    allowedRoutes:
-      namespaces:
-        from: Same
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: bookinfo-external
-  namespace: bookinfo-external
-spec:
-  parentRefs:
-  - name: bookinfo-external-gateway
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /productpage
-    - path:
-        type: PathPrefix
-        value: /static
-    - path:
-        type: PathPrefix
-        value: /login
-    - path:
-        type: PathPrefix
-        value: /logout
-    backendRefs:
-    - name: productpage
-      port: 9080
----
-apiVersion: route.openshift.io/v1
-kind: Route
-metadata:
-  name: bookinfo-external-gateway
-  namespace: bookinfo-external
-spec:
-  host: bookinfo-external.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com
-  port:
-    targetPort: 80
-  to:
-    kind: Service
-    name: bookinfo-external-gateway-istio
-    weight: 100
-RESOURCES
-echo -e "  ${PASS} ServiceAccount, Service, Deployment, Gateway, HTTPRoute, Route ${GREEN}applied${RESET}"
-
-section "Waiting for pods to be ready"
-oc --context east -n bookinfo-external rollout status deployment/productpage-v1 --timeout=120s &>/dev/null
-echo -e "  ${PASS} productpage-v1: ${GREEN}ready${RESET}"
-
-sleep 5
+section "Verify productpage pod is running"
+if oc --context east -n bookinfo-external get deployment productpage-v1 &>/dev/null; then
+  READY=$(oc --context east -n bookinfo-external get deployment productpage-v1 -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+  if [[ "${READY:-0}" -ge 1 ]]; then
+    echo -e "  ${PASS} productpage-v1: ${GREEN}ready${RESET}"
+  else
+    echo -e "  ${WARN} productpage-v1: waiting for ready..."
+    oc --context east -n bookinfo-external rollout status deployment/productpage-v1 --timeout=120s &>/dev/null
+    echo -e "  ${PASS} productpage-v1: ${GREEN}ready${RESET}"
+  fi
+else
+  echo -e "  ${FAIL} Deployment productpage-v1 not found in bookinfo-external"
+  exit 1
+fi
 
 section "SPIFFE identities"
 echo -e "  ${CYAN}bookinfo${RESET}:          spiffe://cluster.local/ns/bookinfo/sa/bookinfo-productpage"
@@ -242,9 +135,10 @@ metadata:
   name: reviews-deny-external
   namespace: bookinfo
 spec:
-  selector:
-    matchLabels:
-      app: reviews
+  targetRefs:
+  - kind: Service
+    group: ""
+    name: reviews
   action: DENY
   rules:
   - from:
@@ -294,9 +188,10 @@ metadata:
   name: reviews-allow-by-identity
   namespace: bookinfo
 spec:
-  selector:
-    matchLabels:
-      app: reviews
+  targetRefs:
+  - kind: Service
+    group: ""
+    name: reviews
   action: ALLOW
   rules:
   - from:

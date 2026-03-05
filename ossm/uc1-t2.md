@@ -98,6 +98,17 @@ Every pod should show only its application container (e.g., `productpage`, `deta
 | Namespace label | `dataplane-mode=ambient` | `dataplane-mode=ambient` |
 | Sidecar (istio-proxy) | **None** | **None** |
 
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| Istio ambient profile | Deploys mesh without sidecars | Yes — mesh architecture |
+| IstioCNI | Configures network redirection for ambient | Yes — mesh CNI plugin |
+| ztunnel DaemonSet | L4 mTLS, per node, transparent to pods | Yes — L4 data plane |
+| istiod | Control plane, pushes config to ztunnel | Yes — control plane |
+| `dataplane-mode=ambient` label | Enrolls namespace in the mesh | Yes — mesh enrollment |
+| No `istio-proxy` in pods | Proves sidecarless architecture | Yes — ambient mode proof |
+
 ## Key Takeaway
 
 In ambient mode, the mesh is provided transparently at the infrastructure level via ztunnel (L4) and optional waypoint proxies (L7). Application pods are never modified — no sidecar injection, no restarts required to join the mesh.

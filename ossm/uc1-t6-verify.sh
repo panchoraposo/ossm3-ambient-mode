@@ -73,8 +73,11 @@ echo -e "${BOLD}╚════════════════════�
 
 # Step 1: Baseline
 header "1. Verify Baseline"
+echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
 check_reviews_status "before changes" "false"
 check_restarts "before changes"
+
+read -rp "  ⏎ Press ENTER to apply L4 + Policy changes..." _
 
 # Step 2 & 3: Apply both changes simultaneously
 header "2. Apply L4 Change (Telemetry) + Policy Change (AuthorizationPolicy)"
@@ -106,9 +109,10 @@ metadata:
   name: deny-reviews-from-productpage
   namespace: bookinfo
 spec:
-  selector:
-    matchLabels:
-      app: reviews
+  targetRefs:
+    - kind: Service
+      group: ""
+      name: reviews
   action: DENY
   rules:
     - from:
@@ -119,8 +123,8 @@ EOF
 echo -e "  ${PASS} AuthorizationPolicy ${RED}deny-reviews-from-productpage${RESET} applied to bookinfo"
 
 echo ""
-echo -e "  Waiting 3 seconds for propagation..."
-sleep 3
+echo -e "  Waiting 10 seconds for propagation..."
+sleep 10
 
 # Step 3: Verify both changes
 header "3. Verify Both Changes"
@@ -157,8 +161,8 @@ echo -e "  ${PASS} AuthorizationPolicy ${GREEN}removed${RESET}"
 oc --context east delete telemetry ztunnel-logging -n istio-system 2>/dev/null
 echo -e "  ${PASS} Telemetry ${GREEN}removed${RESET}"
 echo ""
-echo -e "  Waiting 3 seconds..."
-sleep 3
+echo -e "  Waiting 10 seconds..."
+sleep 10
 
 # Step 5: Verify recovery
 header "5. Verify Recovery"

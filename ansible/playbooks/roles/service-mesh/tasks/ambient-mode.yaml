@@ -67,6 +67,13 @@
           cni:
             ambient:
               reconcileIptablesOnStartup: true
+              # dnsCapture: enables ztunnel to intercept pod DNS queries and resolve
+              # ServiceEntry hosts to auto-allocated VIPs (240.240.x.x). Without this,
+              # external traffic bypasses the mesh entirely because pods resolve DNS to
+              # real external IPs that ztunnel's iptables rules cannot match.
+              # Required for egress control (UC20-T5): ServiceEntry + egress waypoint
+              # + AuthorizationPolicy pattern.
+              dnsCapture: true
 
 - name: Deploy Istio Control Plane (With Tracing Provider)
   kubernetes.core.k8s:

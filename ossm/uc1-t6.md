@@ -13,8 +13,9 @@ Demonstrate that ztunnel observability (L4) and security policies (Authorization
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed
-- `generate-traffic.sh` running
-- Kiali open (OSSMC via ACM console)
+- `generate-traffic.sh` running for Kiali visualization
+- Kiali open (OSSMC via ACM console):
+  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 
 ## Test
 
@@ -59,9 +60,10 @@ metadata:
   name: deny-reviews-from-productpage
   namespace: bookinfo
 spec:
-  selector:
-    matchLabels:
-      app: reviews
+  targetRefs:
+    - kind: Service
+      group: ""
+      name: reviews
   action: DENY
   rules:
     - from:
@@ -70,6 +72,8 @@ spec:
               - "cluster.local/ns/bookinfo/sa/bookinfo-productpage"
 EOF
 ```
+
+> **Note:** In ambient mode, `targetRefs` (pointing to a Service) must be used instead of `selector.matchLabels`. The waypoint proxy enforces the policy on behalf of the target service.
 
 ### 4. Verify both changes
 
@@ -122,6 +126,16 @@ Reviews section recovers immediately in the browser. No pod restarts needed.
 | ztunnel Telemetry (L4) | None | Access logs enabled — full connection visibility with SPIFFE identities |
 | AuthorizationPolicy DENY (Policy) | None | Reviews blocked instantly — "Error fetching product reviews!" in UI, red edge in Kiali |
 | Cleanup | None | Instant recovery, no restarts |
+
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| Telemetry (ztunnel access logging) | L4 observability — connection logs with SPIFFE identities | Yes — mesh telemetry |
+| AuthorizationPolicy (DENY) | L7 security — blocks traffic by identity | Yes — mesh security |
+| ztunnel | Enforces both changes independently, no restarts | Yes — L4 data plane |
+| istiod | Pushes Telemetry and policy config to ztunnel | Yes — control plane |
+| Kiali | Shows red edge for denied traffic | Yes — mesh observability |
 
 ## Key Takeaway
 

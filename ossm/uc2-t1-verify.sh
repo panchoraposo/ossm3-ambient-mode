@@ -104,8 +104,11 @@ echo -e "${BOLD}╚════════════════════�
 
 # Step 1: Baseline
 header "1. Baseline"
+echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
+echo -e "  → Open in browser: ${BOLD}${WEST_ROUTE}${RESET}"
 test_traffic "before lockdown" "true"
 check_restarts "before lockdown"
+read -rp "  ⏎ Press ENTER to apply deny-all lockdown..." _
 
 # Step 2: Apply deny-all
 header "2. Apply Deny-All to Root Namespace"

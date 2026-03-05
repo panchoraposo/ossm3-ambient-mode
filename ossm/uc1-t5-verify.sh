@@ -78,8 +78,11 @@ echo -e "${BOLD}╚════════════════════�
 
 # Step 1: Baseline
 header "1. Verify Initial State"
+echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
+echo -e "  → Open in browser: ${BOLD}${WEST_ROUTE}${RESET}"
 check_istiod "before failure"
 test_traffic "before failure"
+read -rp "  ⏎ Press ENTER to simulate control plane failure..." _
 
 # Step 2: Kill istiod in EAST
 header "2. Simulate Control Plane Failure in EAST"

@@ -7,8 +7,9 @@ Apply a global deny-all AuthorizationPolicy to the root namespace of the mesh (`
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed and accessible
-- `generate-traffic.sh` running (optional, to see the effect in Kiali)
-- Kiali open (OSSMC via ACM console)
+- `generate-traffic.sh` running for Kiali visualization (recommended — shows edges turning red when deny-all is applied)
+- Kiali open (OSSMC via ACM console):
+  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 
 ## Quick Run
 
@@ -107,6 +108,16 @@ Expected: HTTP 200 on both — instant recovery, no restarts needed.
 | Baseline | HTTP 200 | HTTP 200 | 0 |
 | Deny-all applied | **Denied** | **Denied** | 0 |
 | After cleanup | HTTP 200 | HTTP 200 | 0 |
+
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| AuthorizationPolicy (deny-all) | Global zero-trust policy in root namespace | Yes — mesh security |
+| ztunnel | Enforces deny at L4, rejects TCP connections | Yes — L4 data plane |
+| istiod | Pushes global policy to all ztunnels | Yes — control plane |
+| Root namespace (`istio-system`) | Policy propagation scope for the entire mesh | Yes — mesh config |
+| Kiali | Shows red (denied) edges across all services | Yes — mesh observability |
 
 ## Key Takeaway
 

@@ -7,7 +7,9 @@ Verify that both clusters share a single Root CA (unified trust), that mTLS is e
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed
-- `generate-traffic.sh` running
+- `generate-traffic.sh` running for Kiali visualization
+- Kiali open (OSSMC via ACM console):
+  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 
 ## Quick Run
 
@@ -93,6 +95,17 @@ This means: original traffic to port 9080 is **always** encrypted via HBONE tunn
 | mTLS | Always on (ztunnel) | Always on (ztunnel) |
 | SPIFFE trust domain | `cluster.local` | `cluster.local` |
 | Traffic encryption | HBONE port 15008 | HBONE port 15008 |
+
+## What is Service Mesh here
+
+| Component | Role | Mesh feature? |
+|-----------|------|:------------:|
+| Shared Root CA | Unified trust domain across clusters | Yes — mTLS PKI |
+| Per-cluster Intermediate CAs | Issue workload certificates locally | Yes — mTLS PKI |
+| SPIFFE identities | Cryptographic identity per ServiceAccount | Yes — identity |
+| ztunnel | Enforces mTLS on every connection, HBONE tunneling | Yes — L4 data plane |
+| HBONE (port 15008) | Encrypted tunnel for all pod-to-pod traffic | Yes — mesh transport |
+| istiod | Distributes certificates to ztunnel | Yes — control plane |
 
 ## Key Takeaway
 
