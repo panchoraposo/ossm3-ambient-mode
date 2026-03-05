@@ -1,8 +1,8 @@
-# UC1-T6: Infrastructure Segregation (L4 vs Policy)
+# UC1-T6: Infrastructure Segregation (L4 vs L7)
 
 ## Objective
 
-Demonstrate that ztunnel observability (L4) and security policies (AuthorizationPolicy) are independent layers. Two teams can make changes simultaneously without coordination or application pod restarts.
+Demonstrate that L4 infrastructure (ztunnel observability) and L7 policies (AuthorizationPolicy via waypoint) are independent layers. Two teams can make changes simultaneously without coordination or application pod restarts.
 
 ## Quick Run
 
@@ -13,9 +13,7 @@ Demonstrate that ztunnel observability (L4) and security policies (Authorization
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed
-- `generate-traffic.sh` running for Kiali visualization
-- Kiali open (OSSMC via ACM console):
-  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
+- `generate-traffic.sh` running (for log data)
 
 ## Test
 
@@ -27,7 +25,36 @@ curl -s -o /dev/null -w "%{http_code}\n" http://bookinfo.apps.cluster-64k4b.64k4
 
 Confirm HTTP 200 and normal latency. Open bookinfo in browser — reviews section shows normally (with or without stars).
 
-### 2. L4 change (Infra/DevOps team) — Enable ztunnel access logging
+### 2. Deploy reviews-waypoint (L7 proxy)
+
+The AuthorizationPolicy with `targetRefs` requires a waypoint proxy to enforce L7 policies. Deploy it on demand:
+
+```bash
+oc --context east apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reviews-waypoint
+  namespace: bookinfo
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+
+oc --context east label svc reviews -n bookinfo istio.io/use-waypoint=reviews-waypoint --overwrite
+oc --context east wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n bookinfo --timeout=60s
+```
+
+### 3. Apply L4 change (ztunnel) + L7 change (waypoint)
+
+Both changes are applied simultaneously — different teams, different layers, no coordination needed.
+
+**L4 (Infra/DevOps team) — Enable ztunnel access logging (no waypoint needed):**
 
 ```bash
 oc --context east apply -f - <<EOF
@@ -48,9 +75,7 @@ spec:
 EOF
 ```
 
-### 3. Policy change (Security/Dev team) — Deny reviews access from productpage
-
-Apply simultaneously with Step 2:
+**L7 (Security/Dev team) — Deny reviews from productpage (via waypoint):**
 
 ```bash
 oc --context east apply -f - <<EOF
@@ -85,46 +110,59 @@ oc --context east get pods -n bookinfo -o custom-columns='NAME:.metadata.name,RE
 
 All pods must show 0 restarts.
 
-**L4 — ztunnel access logs now visible:**
+**L4 — ztunnel connection logs:**
 
 ```bash
 oc --context east logs -n ztunnel ds/ztunnel --tail=20 | grep reviews
 ```
 
-Expected: logs showing connections to reviews with SPIFFE identities, bytes, duration, and DENY errors:
+Expected: L4 connection entries showing traffic to reviews with SPIFFE identities, bytes, and duration. Note: ztunnel operates at L4 and sees connections, not HTTP-level denials.
 
 ```
-error  access  connection complete  src.workload="productpage-v1-..." src.identity="spiffe://cluster.local/ns/bookinfo/sa/bookinfo-productpage" dst.service="reviews.bookinfo.svc.cluster.local" ... error="connection closed due to policy rejection: explicitly denied by: bookinfo/deny-reviews-from-productpage"
+info  access  connection complete  src.workload="productpage-v1-..." src.identity="spiffe://cluster.local/ns/bookinfo/sa/bookinfo-productpage" dst.service="reviews.bookinfo.svc.cluster.local" ...
 ```
+
+**L7 — waypoint RBAC stats:**
+
+```bash
+WP_POD=$(oc --context east get pods -n bookinfo -l gateway.networking.k8s.io/gateway-name=reviews-waypoint --no-headers | awk '{print $1}' | head -1)
+oc --context east exec "$WP_POD" -n bookinfo -- pilot-agent request GET /stats | grep rbac
+```
+
+Expected: RBAC denied count greater than 0, confirming the waypoint is enforcing the AuthorizationPolicy at L7:
+
+```
+http.inbound_0.0.0.0_9080;.rbac.allowed: 42
+http.inbound_0.0.0.0_9080;.rbac.denied: 18
+```
+
+> **Note:** RBAC enforcement stats are available directly from the waypoint's Envoy engine via `pilot-agent request GET /stats | grep rbac`. This is the most reliable way to verify denials.
 
 **Policy — reviews blocked in the UI:**
 
+Open bookinfo in browser — the reviews section shows **"Error fetching product reviews!"** while details and ratings continue working.
+
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage
+curl -s http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage | grep -o "Error fetching product reviews"
 ```
 
-Expected: HTTP 200, but open bookinfo in browser — the reviews section shows **"Error fetching product reviews!"** while details and ratings continue working.
-
-### 5. Check Kiali
-
-- **Kiali graph**: traffic edge from productpage to reviews marked in **red** (errors). Rest of the graph stays green.
-- **Kiali service detail**: Select `reviews` service — error rate increases to 100%.
-
-### 6. Cleanup
+### 5. Cleanup
 
 ```bash
 oc --context east delete authorizationpolicy deny-reviews-from-productpage -n bookinfo
 oc --context east delete telemetry ztunnel-logging -n istio-system
+oc --context east label svc reviews -n bookinfo istio.io/use-waypoint-
+oc --context east delete gateway reviews-waypoint -n bookinfo
 ```
 
-Reviews section recovers immediately in the browser. No pod restarts needed.
+Reviews section recovers immediately in the browser. No pod restarts needed. The waypoint proxy (L7) is removed, returning to the L4-only ztunnel baseline.
 
 ## Expected Results
 
 | Action | Pods restarted | Impact |
 |--------|---------------|--------|
-| ztunnel Telemetry (L4) | None | Access logs enabled — full connection visibility with SPIFFE identities |
-| AuthorizationPolicy DENY (Policy) | None | Reviews blocked instantly — "Error fetching product reviews!" in UI, red edge in Kiali |
+| L4: ztunnel Telemetry | None | Access logs enabled — full connection visibility with SPIFFE identities |
+| L7: AuthorizationPolicy DENY (waypoint) | None | Reviews blocked instantly — "Error fetching product reviews!" in UI, `rbac.denied` count in waypoint stats |
 | Cleanup | None | Instant recovery, no restarts |
 
 ## What is Service Mesh here
@@ -132,11 +170,11 @@ Reviews section recovers immediately in the browser. No pod restarts needed.
 | Component | Role | Mesh feature? |
 |-----------|------|:------------:|
 | Telemetry (ztunnel access logging) | L4 observability — connection logs with SPIFFE identities | Yes — mesh telemetry |
-| AuthorizationPolicy (DENY) | L7 security — blocks traffic by identity | Yes — mesh security |
-| ztunnel | Enforces both changes independently, no restarts | Yes — L4 data plane |
-| istiod | Pushes Telemetry and policy config to ztunnel | Yes — control plane |
-| Kiali | Shows red edge for denied traffic | Yes — mesh observability |
+| AuthorizationPolicy (DENY) | L7 security — blocks traffic by identity via waypoint | Yes — mesh security |
+| ztunnel | L4 data plane — mTLS, telemetry, connection-level enforcement | Yes — L4 data plane |
+| Waypoint proxy | L7 data plane — HTTP-level policy enforcement (AuthorizationPolicy) | Yes — L7 data plane |
+| istiod | Pushes Telemetry and policy config to ztunnel and waypoint | Yes — control plane |
 
 ## Key Takeaway
 
-Infrastructure observability (L4 Telemetry) and security policies (AuthorizationPolicy) are fully decoupled. Different teams operate at different layers without coordination or pod restarts. Changes take effect immediately and are reversible in seconds.
+L4 infrastructure (ztunnel Telemetry) and L7 policies (AuthorizationPolicy via waypoint) are fully decoupled. Different teams operate at different layers — L4 changes go through ztunnel, L7 changes go through the waypoint proxy — without coordination or pod restarts. Changes take effect immediately and are reversible in seconds.

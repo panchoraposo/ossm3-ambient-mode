@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 MESH_CONTEXTS=("east" "west")
 
 header() {
@@ -29,7 +35,7 @@ section() {
 }
 
 check_trust_domain() {
-  header "1. Shared Trust Domain"
+  header "1. Shared Trust Domain (SPIFFE)"
   domains=()
   for ctx in "${MESH_CONTEXTS[@]}"; do
     section "Cluster: $(echo "$ctx" | tr '[:lower:]' '[:upper:]')"
@@ -54,7 +60,7 @@ check_trust_domain() {
 }
 
 check_multicluster_config() {
-  header "2. Multi-Cluster Configuration"
+  header "3. Multi-Cluster Configuration (Istio CR)"
   for ctx in "${MESH_CONTEXTS[@]}"; do
     section "Cluster: $(echo "$ctx" | tr '[:lower:]' '[:upper:]')"
     mc_json=$(oc --context "$ctx" get istio default -n istio-system -o jsonpath='{.spec.values.global.multiCluster}' 2>/dev/null)
@@ -73,7 +79,7 @@ check_multicluster_config() {
 }
 
 check_remote_secrets() {
-  header "3. Remote Secrets (Cross-Cluster API Access)"
+  header "2. Remote Secrets (Cross-Cluster API Access)"
   for ctx in "${MESH_CONTEXTS[@]}"; do
     section "Cluster: $(echo "$ctx" | tr '[:lower:]' '[:upper:]')"
     secrets=$(oc --context "$ctx" get secrets -n istio-system -l istio/multiCluster=true --no-headers 2>/dev/null)
@@ -89,21 +95,11 @@ check_remote_secrets() {
   done
 }
 
-check_network_topology() {
-  header "4. Network Topology"
-  for ctx in "${MESH_CONTEXTS[@]}"; do
-    section "Cluster: $(echo "$ctx" | tr '[:lower:]' '[:upper:]')"
-    network=$(oc --context "$ctx" get ns istio-system -o jsonpath='{.metadata.labels.topology\.istio\.io/network}' 2>/dev/null)
-    if [[ -n "$network" ]]; then
-      echo -e "  ${PASS} Network: ${GREEN}${BOLD}${network}${RESET}"
-    else
-      echo -e "  ${WARN} No network label on istio-system namespace"
-    fi
-  done
-}
-
 check_eastwest_gateways() {
-  header "5. East-West Gateways"
+  header "4. East-West Gateways (Control Plane Federation)"
+  echo ""
+  echo -e "  These gateways allow each istiod to reach the remote cluster's API server."
+  echo -e "  They handle ${BOLD}control plane${RESET} connectivity, not user data plane traffic."
   for ctx in "${MESH_CONTEXTS[@]}"; do
     section "Cluster: $(echo "$ctx" | tr '[:lower:]' '[:upper:]')"
     ewgw=$(oc --context "$ctx" get pods -n istio-system --no-headers 2>/dev/null | grep eastwest)
@@ -126,27 +122,29 @@ check_eastwest_gateways() {
 }
 
 check_service_discovery() {
-  header "6. Automatic Service Discovery"
+  header "5. Automatic Service Discovery"
+  echo ""
+  echo -e "  In multi-primary with remote secrets, istiod discovers ${BOLD}all${RESET} services"
+  echo -e "  from the remote cluster automatically — no special labels needed."
   for ctx in "${MESH_CONTEXTS[@]}"; do
     section "Cluster: $(echo "$ctx" | tr '[:lower:]' '[:upper:]')"
-    services=$(oc --context "$ctx" get svc -n bookinfo -l istio.io/global=true --no-headers 2>/dev/null)
+    services=$(oc --context "$ctx" get svc -n bookinfo --no-headers 2>/dev/null | grep -v "^kubernetes")
     if [[ -n "$services" ]]; then
       svc_count=$(echo "$services" | wc -l | tr -d ' ')
-      echo -e "  ${PASS} ${GREEN}${svc_count} services${RESET} labeled for global discovery:"
+      echo -e "  ${PASS} ${GREEN}${svc_count} bookinfo services${RESET} discovered:"
       echo "$services" | while read -r line; do
         svc_name=$(echo "$line" | awk '{print $1}')
-        svc_type=$(echo "$line" | awk '{print $2}')
         svc_ip=$(echo "$line" | awk '{print $3}')
-        echo -e "    ${PASS} ${svc_name}  (${svc_type} ${svc_ip})"
+        echo -e "    ${PASS} ${svc_name}  (${svc_ip})"
       done
     else
-      echo -e "  ${WARN} No services with istio.io/global=true label"
+      echo -e "  ${FAIL} No services found in bookinfo namespace"
     fi
   done
 }
 
 check_kiali() {
-  header "7. Kiali (ACM Console)"
+  header "6. Kiali (ACM Console)"
   echo ""
   echo -e "  Open Kiali from the ACM console to verify the unified graph:"
   echo ""
@@ -155,8 +153,7 @@ check_kiali() {
   echo -e "  ${BOLD}Verify:${RESET}"
   echo -e "    • Select namespace ${BOLD}bookinfo${RESET}"
   echo -e "    • Both clusters (EAST and WEST) appear in the graph"
-  echo -e "    • Services from both clusters are visible"
-  echo -e "    • Traffic edges show cross-cluster communication"
+  echo -e "    • Services from both clusters are discovered and visible"
 }
 
 summary() {
@@ -164,10 +161,9 @@ summary() {
   echo ""
   echo -e "  ${BOLD}Trust domain:${RESET}      ${GREEN}cluster.local${RESET} (shared)"
   echo -e "  ${BOLD}Cluster IDs:${RESET}       east, west"
-  echo -e "  ${BOLD}Networks:${RESET}          network1 (EAST), network2 (WEST)"
   echo -e "  ${BOLD}Peering:${RESET}           Remote secrets exchanged"
+  echo -e "  ${BOLD}EW Gateways:${RESET}       Control plane cross-cluster connectivity"
   echo -e "  ${BOLD}Discovery:${RESET}         Automatic via istiod + remote secrets"
-#  echo -e "  ${BOLD}Cross-network:${RESET}     East-west gateways (HBONE over mTLS)"
   echo ""
 }
 
@@ -178,16 +174,15 @@ echo -e "${BOLD}║   UC1-T3: Multi-Primary Federation & Discovery             �
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${RESET}"
 
 check_trust_domain
-check_multicluster_config
-read -rp "  ⏎ Press ENTER to continue..." _
-
 check_remote_secrets
-check_network_topology
+pause
+
+check_multicluster_config
 check_eastwest_gateways
-read -rp "  ⏎ Press ENTER to continue..." _
+pause
 
 check_service_discovery
 check_kiali
-read -rp "  ⏎ Press ENTER to continue..." _
+pause
 
 summary

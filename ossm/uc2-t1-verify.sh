@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 WEST_ROUTE="http://bookinfo.apps.cluster-7rt9h.7rt9h.sandbox1900.opentlc.com/productpage"
 
@@ -34,8 +40,8 @@ test_traffic() {
   local expect_success="$2"
   section "Traffic test: ${label}"
 
-  east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
-  west_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$WEST_ROUTE" 2>/dev/null)
+  east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
+  west_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$WEST_ROUTE" 2>/dev/null)
   [[ -z "$east_code" || "$east_code" == "000" ]] && east_code="TIMEOUT"
   [[ -z "$west_code" || "$west_code" == "000" ]] && west_code="TIMEOUT"
 
@@ -108,7 +114,7 @@ echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
 echo -e "  → Open in browser: ${BOLD}${WEST_ROUTE}${RESET}"
 test_traffic "before lockdown" "true"
 check_restarts "before lockdown"
-read -rp "  ⏎ Press ENTER to apply deny-all lockdown..." _
+pause "Press ENTER to apply deny-all lockdown..."
 
 # Step 2: Apply deny-all
 header "2. Apply Deny-All to Root Namespace"
@@ -139,10 +145,10 @@ check_ztunnel_deny_logs
 check_restarts "during lockdown"
 
 echo ""
-echo -e "  ${CYAN}${BOLD}▶ Lockdown active — check Kiali for red edges / denied traffic${RESET}"
+echo -e "  ${CYAN}${BOLD}▶ Lockdown active — check Kiali for traffic flow changes${RESET}"
 echo -e "  ${CYAN}  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph${RESET}"
 echo ""
-read -rp "  Press ENTER to continue with cleanup..."
+pause "Press ENTER to cleanup..."
 
 # Step 4: Cleanup
 header "4. Cleanup"

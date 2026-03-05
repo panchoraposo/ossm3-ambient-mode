@@ -15,6 +15,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
 CTX="east"
@@ -36,8 +42,13 @@ cleanup() {
   section "Cleanup: removing resources"
   oc --context "$CTX" delete httproute reviews-timeout -n "$NS" 2>/dev/null
   oc --context "$CTX" delete virtualservice ratings-delay -n "$NS" 2>/dev/null
-  echo -e "  ${PASS} HTTPRoute + VirtualService removed"
+  oc --context "$CTX" label svc reviews -n "$NS" istio.io/use-waypoint- 2>/dev/null
+  oc --context "$CTX" label svc ratings -n "$NS" istio.io/use-waypoint- 2>/dev/null
+  oc --context "$CTX" delete gateway reviews-waypoint -n "$NS" 2>/dev/null
+  oc --context "$CTX" delete gateway ratings-waypoint -n "$NS" 2>/dev/null
+  echo -e "  ${PASS} All resources removed (HTTPRoute, VirtualService, waypoints)"
 }
+trap cleanup EXIT
 
 PRODUCTPAGE_POD=""
 
@@ -69,7 +80,7 @@ print(json.dumps(results))
 header "UC20-T2: Request Timeouts — HTTPRoute"
 
 section "1. Baseline — verify bookinfo"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET}"
 else
@@ -98,10 +109,36 @@ if all_fast:
 
 echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
 echo -e "  → Kiali graph: ${BOLD}${KIALI_URL}${RESET}"
-read -rp "  ⏎ Press ENTER to inject delay + timeout..." _
+pause "Press ENTER to deploy waypoints and inject delay + timeout..."
+
+# ── Deploy waypoints ─────────────────────────────────────────────────
+section "3. Deploy waypoints (reviews + ratings)"
+for svc in reviews ratings; do
+  oc --context "$CTX" apply -f - <<EOF 2>/dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ${svc}-waypoint
+  namespace: $NS
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+  oc --context "$CTX" label svc "$svc" -n "$NS" istio.io/use-waypoint="${svc}-waypoint" --overwrite 2>/dev/null
+  echo -e "  ${PASS} ${svc}-waypoint created and service labeled"
+done
+echo -e "  Waiting for waypoint pods..."
+oc --context "$CTX" wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n "$NS" --timeout=60s 2>/dev/null
+oc --context "$CTX" wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=ratings-waypoint -n "$NS" --timeout=60s 2>/dev/null
+echo -e "  ${PASS} Both waypoint pods ${GREEN}Ready${RESET}"
 
 # ── Apply delay + timeout ───────────────────────────────────────────
-section "3. Inject delay on ratings (5s) via VirtualService"
+section "4. Inject delay on ratings (5s) via VirtualService"
 oc --context "$CTX" apply -f - <<'EOF'
 apiVersion: networking.istio.io/v1
 kind: VirtualService
@@ -123,7 +160,7 @@ spec:
 EOF
 echo -e "  ${PASS} VirtualService delay on ratings applied (5s)"
 
-section "4. Set timeout on reviews via HTTPRoute (2s)"
+section "5. Set timeout on reviews via HTTPRoute (2s)"
 oc --context "$CTX" apply -f - <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -149,7 +186,7 @@ echo -e "  Waiting for config propagation..."
 sleep 15
 
 # ── Test timeout behavior ────────────────────────────────────────────
-section "5. Test — expect mix of fast (v1) and timeout (v2/v3)"
+section "6. Test — expect mix of fast (v1) and timeout (v2/v3)"
 result=$(call_reviews_batch 9)
 
 got_504=false
@@ -202,9 +239,9 @@ print('true' if any(r['status'] in [200,404] and r['elapsed'] < 1.5 for r in dat
 
 echo ""
 echo -e "  → Refresh browser: ${BOLD}${EAST_ROUTE}${RESET} (v2/v3 reviews timeout at ~2s)"
-echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET} (red/yellow edges on reviews)"
+echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET} (observe traffic flow on reviews)"
 echo -e "  → Try: ${CYAN}curl -s -o /dev/null -w 'HTTP %%{http_code} in %%{time_total}s' ${EAST_ROUTE}${RESET}"
-read -rp "  ⏎ Press ENTER to cleanup..." _
+pause "Press ENTER to cleanup..."
 
 # ── Cleanup ──────────────────────────────────────────────────────────
 cleanup
@@ -239,8 +276,8 @@ else
 fi
 
 sleep 5
-section "6. Verify recovery after cleanup"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+section "7. Verify recovery after cleanup"
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET} — normal operation restored"
 else

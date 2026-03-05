@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
 
@@ -121,7 +127,7 @@ else
   echo -e "  ${FAIL} DNS resolution failed"
 fi
 
-read -rp "  ⏎ Press ENTER to continue..." _
+pause
 
 # ── Step 3: Generate intra-cluster traffic ─────────────────────────────────
 header "3. Generate Intra-Cluster Traffic"
@@ -129,7 +135,7 @@ header "3. Generate Intra-Cluster Traffic"
 echo -e "  Sending 5 requests to productpage (productpage → reviews within EAST)..."
 echo ""
 for i in $(seq 1 5); do
-  http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
   if [[ "$http_code" == "200" ]]; then
     echo -e "  ${PASS} Request $i: HTTP ${GREEN}${http_code}${RESET}"
   else
@@ -207,7 +213,7 @@ else
   echo -e "  ${WARN} No reviews entries in ztunnel logs — try generating more traffic"
 fi
 
-read -rp "  ⏎ Press ENTER to continue..." _
+pause
 
 # ── Step 5: Verify no east-west gateway involvement ───────────────────────
 header "5. Verify No East-West Gateway Involvement"
@@ -252,7 +258,7 @@ echo -e "  ${CYAN}  Expected: direct pod-to-pod flow within the EAST cluster,${R
 echo -e "  ${CYAN}  no east-west gateway involved.${RESET}"
 echo -e "  ${CYAN}  ${KIALI_URL}${RESET}"
 echo ""
-read -rp "  Press ENTER to continue with cleanup..."
+pause "Press ENTER to cleanup..."
 stop_traffic
 
 # ── Step 6: Cleanup ───────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ Apply a global deny-all AuthorizationPolicy to the root namespace of the mesh (`
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed and accessible
-- `generate-traffic.sh` running for Kiali visualization (recommended — shows edges turning red when deny-all is applied)
+- `generate-traffic.sh` running for Kiali visualization (recommended — shows traffic flow changes when deny-all is applied)
 - Kiali open (OSSMC via ACM console):
   https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 
@@ -82,7 +82,7 @@ All pods should show 0 restarts.
 
 ### 5. Check Kiali
 
-- **Kiali graph**: all edges turn **red** (100% error rate)
+- **Kiali graph**: observe traffic flow — denied connections stop generating edges
 - Both clusters affected simultaneously
 
 ### 6. Cleanup — remove deny-all
@@ -117,7 +117,7 @@ Expected: HTTP 200 on both — instant recovery, no restarts needed.
 | ztunnel | Enforces deny at L4, rejects TCP connections | Yes — L4 data plane |
 | istiod | Pushes global policy to all ztunnels | Yes — control plane |
 | Root namespace (`istio-system`) | Policy propagation scope for the entire mesh | Yes — mesh config |
-| Kiali | Shows red (denied) edges across all services | Yes — mesh observability |
+| Kiali | Shows traffic flow and denied connections across services | Yes — mesh observability |
 
 ## Key Takeaway
 

@@ -11,7 +11,6 @@ This is fundamentally different from UC12 (HTTPRoute at the ingress gateway): he
 ## Prerequisites
 
 - Both clusters running with bookinfo deployed and accessible
-- Waypoint proxies deployed and processing traffic (reviews-waypoint)
 - `generate-traffic.sh` running for Kiali visualization (recommended — shows traffic split in real-time)
 - Kiali open (OSSMC via ACM console):
   https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
@@ -127,7 +126,32 @@ for i in range(6):
 
 Expected: responses from v1, v2, and v3 (round-robin).
 
-### 3. Phase A: Apply HTTPRoute — 100% v1
+### 3. Deploy reviews-waypoint (L7 proxy)
+
+The HTTPRoute with `parentRefs` targeting a Service requires a waypoint proxy. Deploy it on demand:
+
+```bash
+oc --context east apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reviews-waypoint
+  namespace: bookinfo
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+
+oc --context east label svc reviews -n bookinfo istio.io/use-waypoint=reviews-waypoint --overwrite
+oc --context east wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n bookinfo --timeout=60s
+```
+
+### 4. Phase A: Apply HTTPRoute — 100% v1
 
 ```bash
 oc --context east apply -f - <<EOF
@@ -155,7 +179,7 @@ EOF
 
 Expected: **only reviews-v1** pods in the responses.
 
-### 4. Phase B: Canary 50/50 — split traffic
+### 5. Phase B: Canary 50/50 — split traffic
 
 ```bash
 oc --context east apply -f - <<EOF
@@ -183,7 +207,7 @@ EOF
 
 Expected: ~50% reviews-v1, ~50% reviews-v3.
 
-### 5. Phase C: Promotion — 100% v3
+### 6. Phase C: Promotion — 100% v3
 
 ```bash
 oc --context east apply -f - <<EOF
@@ -211,14 +235,16 @@ EOF
 
 Expected: **only reviews-v3** pods in the responses.
 
-### 6. Cleanup
+### 7. Cleanup
 
 ```bash
 oc --context east delete httproute reviews-canary -n bookinfo
 oc --context east delete svc reviews-v1-only reviews-v3-only -n bookinfo
+oc --context east label svc reviews -n bookinfo istio.io/use-waypoint-
+oc --context east delete gateway reviews-waypoint -n bookinfo
 ```
 
-### 7. Verify recovery
+### 8. Verify recovery
 
 ```bash
 curl -s -o /dev/null -w "EAST: HTTP %{http_code}\n" http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage

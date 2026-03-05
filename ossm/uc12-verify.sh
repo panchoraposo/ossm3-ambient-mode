@@ -20,6 +20,12 @@ KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatwo
 
 ERRORS=0
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 # ── Pre-check: warn if generate-traffic.sh is running ────────────────────
 traffic_pids=$(pgrep -f generate-traffic.sh 2>/dev/null | tr '\n' ' ' | xargs)
 if [[ -n "$traffic_pids" ]]; then
@@ -30,7 +36,7 @@ if [[ -n "$traffic_pids" ]]; then
   echo ""
   echo -e "${YELLOW}   Stop it first:  ${BOLD}kill ${traffic_pids}${RESET}"
   echo ""
-  read -rp "  Press ENTER to continue anyway, or Ctrl+C to stop and kill it first..."
+  pause "Press ENTER to continue anyway, or Ctrl+C to stop and kill it first..."
 fi
 
 header() {
@@ -70,10 +76,10 @@ get_review_version() {
   local header_name="$1"
   local header_value="$2"
   if [[ -n "$header_name" ]]; then
-    curl -s --max-time 10 -H "${header_name}: ${header_value}" "http://${EAST_HOST}/reviews/0" 2>/dev/null \
+    curl -s --max-time 20 --retry 2 --retry-delay 3 -H "${header_name}: ${header_value}" "http://${EAST_HOST}/reviews/0" 2>/dev/null \
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('podname','unknown'))" 2>/dev/null
   else
-    curl -s --max-time 10 "http://${EAST_HOST}/reviews/0" 2>/dev/null \
+    curl -s --max-time 20 --retry 2 --retry-delay 3 "http://${EAST_HOST}/reviews/0" 2>/dev/null \
       | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('podname','unknown'))" 2>/dev/null
   fi
 }
@@ -215,7 +221,7 @@ sleep 3
 test_distribution "100% Green" 10 "100"
 
 section "Verify /productpage still works"
-pp_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "http://${EAST_HOST}/productpage" 2>/dev/null)
+pp_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 --retry 2 --retry-delay 3 "http://${EAST_HOST}/productpage" 2>/dev/null)
 if [[ "$pp_code" == "200" ]]; then
   echo -e "  ${PASS} /productpage HTTP ${GREEN}${pp_code}${RESET}"
 else
@@ -229,7 +235,7 @@ echo -e "  ${CYAN}${BOLD}▶ Generating traffic to /reviews/0 for Kiali...${RESE
 echo -e "  ${CYAN}  Expected in Kiali: 100% traffic to reviews-green (v1)${RESET}"
 echo -e "  ${CYAN}  ${KIALI_URL}${RESET}"
 echo ""
-read -rp "  Press ENTER to continue to Canary..."
+pause "Press ENTER to continue to Canary..."
 stop_traffic
 
 # ── Phase 2: Canary ──────────────────────────────────────────────────────
@@ -250,7 +256,7 @@ echo -e "  ${CYAN}${BOLD}▶ Generating traffic to /reviews/0 for Kiali...${RESE
 echo -e "  ${CYAN}  Expected in Kiali: ~90% reviews-green, ~10% reviews-blue${RESET}"
 echo -e "  ${CYAN}  ${KIALI_URL}${RESET}"
 echo ""
-read -rp "  Press ENTER to continue to Blue Promotion..."
+pause "Press ENTER to continue to Blue Promotion..."
 stop_traffic
 
 # ── Phase 3: Blue Promotion ──────────────────────────────────────────────
@@ -271,7 +277,7 @@ echo -e "  ${CYAN}${BOLD}▶ Generating traffic to /reviews/0 for Kiali...${RESE
 echo -e "  ${CYAN}  Expected in Kiali: 100% traffic to reviews-blue (v3)${RESET}"
 echo -e "  ${CYAN}  ${KIALI_URL}${RESET}"
 echo ""
-read -rp "  Press ENTER to continue to Header-Based Routing..."
+pause "Press ENTER to continue to Header-Based Routing..."
 stop_traffic
 
 # ── Phase 4: Header-Based Routing ────────────────────────────────────────
@@ -359,7 +365,7 @@ echo -e "  ${CYAN}${BOLD}▶ Try header routing yourself:${RESET}"
 echo -e "  ${CYAN}  curl http://${EAST_HOST}/reviews/0${RESET}"
 echo -e "  ${CYAN}  curl -H \"x-beta-user: true\" http://${EAST_HOST}/reviews/0${RESET}"
 echo ""
-read -rp "  Press ENTER to continue to cleanup..."
+pause "Press ENTER to cleanup..."
 stop_traffic
 
 # ── Phase 5: Cleanup ─────────────────────────────────────────────────────
@@ -408,7 +414,7 @@ echo -e "  ${PASS} Versioned Services ${GREEN}removed${RESET}"
 sleep 3
 
 section "Verify recovery"
-pp_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "http://${EAST_HOST}/productpage" 2>/dev/null)
+pp_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 --retry 2 --retry-delay 3 "http://${EAST_HOST}/productpage" 2>/dev/null)
 if [[ "$pp_code" == "200" ]]; then
   echo -e "  ${PASS} /productpage HTTP ${GREEN}${pp_code}${RESET}"
 else

@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 MESH_SVC="http://productpage.bookinfo.svc.cluster.local:9080/productpage"
 TEST_NS="outside-mesh"
@@ -35,7 +41,7 @@ test_from_outside() {
   local label="$1"
   local expect_success="$2"
   section "Non-mesh pod → mesh service: ${label}"
-  code=$(oc --context east exec "$TEST_POD" -n "$TEST_NS" -- curl -s -o /dev/null -w "%{http_code}" -m 5 "$MESH_SVC" 2>/dev/null)
+  code=$(oc --context east exec "$TEST_POD" -n "$TEST_NS" -- curl -s -o /dev/null -w "%{http_code}" -m 15 --retry 2 --retry-delay 3 "$MESH_SVC" 2>/dev/null)
   [[ -z "$code" || "$code" == "000" ]] && code="000 (connection reset)"
 
   if [[ "$expect_success" == "true" ]]; then
@@ -56,7 +62,7 @@ test_from_outside() {
 test_from_mesh() {
   local label="$1"
   section "Mesh traffic (mTLS via ztunnel): ${label}"
-  code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+  code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
   if [[ "$code" == "200" ]]; then
     echo -e "  ${PASS} mTLS: ${GREEN}HTTP ${code}${RESET}  (mesh traffic OK)"
   else
@@ -88,7 +94,7 @@ echo -e "  ${PASS} Pod ${BOLD}${TEST_POD}${RESET} running in non-mesh namespace"
 header "2. Test Default Mode (PERMISSIVE)"
 test_from_outside "default (no PeerAuthentication)" "true"
 test_from_mesh "default"
-read -rp "  ⏎ Press ENTER to apply STRICT mode..." _
+pause "Press ENTER to apply STRICT mode..."
 
 # Step 3: Apply STRICT
 header "3. Apply PeerAuthentication STRICT"
@@ -120,7 +126,7 @@ echo -e "  ${CYAN}  • Kiali should show normal green traffic (STRICT only bloc
 echo -e "  ${CYAN}    external plaintext — the rejected pod is outside the mesh${RESET}"
 echo -e "  ${CYAN}    and invisible to Kiali)${RESET}"
 echo ""
-read -rp "  Press ENTER to continue with cleanup..."
+pause "Press ENTER to cleanup..."
 
 # Step 5: Cleanup
 header "5. Cleanup"

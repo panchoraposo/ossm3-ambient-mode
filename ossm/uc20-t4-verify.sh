@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
 CTX="east"
@@ -46,7 +52,7 @@ cleanup() {
 header "UC20-T4: Request Authentication (JWT)"
 
 section "1. Baseline — unauthenticated traffic flows"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET} (no JWT required yet)"
 else
@@ -56,7 +62,7 @@ fi
 
 # ── Phase 2: Fetch test JWT ─────────────────────────────────────────
 section "2. Fetch Istio test JWT"
-TOKEN=$(curl -s --max-time 10 "$JWT_URL" 2>/dev/null)
+TOKEN=$(curl -s --max-time 20 --retry 2 --retry-delay 3 "$JWT_URL" 2>/dev/null)
 if [[ -z "$TOKEN" || ${#TOKEN} -lt 100 ]]; then
   echo -e "  ${FAIL} Could not fetch test JWT from ${JWT_URL}"
   exit 1
@@ -112,11 +118,11 @@ echo -e "  Waiting for policies to propagate..."
 sleep 15
 
 echo -e "  → Try: ${CYAN}curl -s -o /dev/null -w '%{http_code}' ${EAST_ROUTE}${RESET}"
-read -rp "  ⏎ Press ENTER to test JWT enforcement..." _
+pause "Press ENTER to test JWT enforcement..."
 
 # ── Phase 5: Test WITHOUT JWT → expect 403 ──────────────────────────
 section "5. Test WITHOUT JWT — expect 403 (Forbidden)"
-no_jwt_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+no_jwt_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$no_jwt_code" == "403" ]]; then
   echo -e "  ${PASS} ${GREEN}HTTP 403${RESET} — request without JWT correctly rejected"
   test_no_jwt="pass"
@@ -130,7 +136,7 @@ fi
 
 # ── Phase 6: Test WITH valid JWT → expect 200 ───────────────────────
 section "6. Test WITH valid JWT — expect 200"
-valid_jwt_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
+valid_jwt_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 \
   -H "Authorization: Bearer $TOKEN" \
   "$EAST_ROUTE" 2>/dev/null)
 if [[ "$valid_jwt_code" == "200" ]]; then
@@ -143,7 +149,7 @@ fi
 
 # ── Phase 7: Test WITH invalid JWT → expect 401 ─────────────────────
 section "7. Test WITH invalid JWT — expect 401 (Unauthorized)"
-invalid_jwt_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 \
+invalid_jwt_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 \
   -H "Authorization: Bearer invalid.token.here" \
   "$EAST_ROUTE" 2>/dev/null)
 if [[ "$invalid_jwt_code" == "401" ]]; then
@@ -159,7 +165,7 @@ echo -e "  → Refresh browser: ${BOLD}${EAST_ROUTE}${RESET} (should show 'RBAC:
 echo -e "  → Try with JWT:  ${CYAN}TOKEN=\$(curl -s ${JWT_URL})${RESET}"
 echo -e "                    ${CYAN}curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer \$TOKEN\" ${EAST_ROUTE}${RESET}"
 echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET}"
-read -rp "  ⏎ Press ENTER to see results and cleanup..." _
+pause "Press ENTER to see results and cleanup..."
 
 # ── Results ─────────────────────────────────────────────────────────
 header "Results"
@@ -194,7 +200,7 @@ trap - EXIT
 
 sleep 5
 section "8. Verify recovery after cleanup"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET} — normal operation restored (no JWT required)"
 else

@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
 CTX="east"
@@ -67,7 +73,7 @@ trap cleanup EXIT
 header "UC20-T5: Egress Control"
 
 section "1. Verify bookinfo and prerequisites"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET}"
 else
@@ -102,7 +108,7 @@ else
   exit 1
 fi
 
-read -rp "  ⏎ Press ENTER to configure egress gateway..." _
+pause "Press ENTER to configure egress gateway..."
 
 # ── Setup egress gateway ─────────────────────────────────────────────
 header "Phase: Configure Egress Gateway"
@@ -167,7 +173,7 @@ else
   test_egress="fail"
 fi
 
-read -rp "  ⏎ Press ENTER to apply egress AuthorizationPolicy..." _
+pause "Press ENTER to apply egress AuthorizationPolicy..."
 
 # ── AuthorizationPolicy ─────────────────────────────────────────────
 header "Phase: Enforce Egress Policy"
@@ -232,7 +238,7 @@ fi
 
 echo ""
 echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET} (check egress-control namespace)"
-read -rp "  ⏎ Press ENTER to cleanup..." _
+pause "Press ENTER to cleanup..."
 
 # ── Cleanup ──────────────────────────────────────────────────────────
 section "8. Cleanup"
@@ -243,7 +249,7 @@ sleep 5
 
 # ── Recovery ─────────────────────────────────────────────────────────
 section "9. Verify recovery"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET} — normal operation restored"
 else

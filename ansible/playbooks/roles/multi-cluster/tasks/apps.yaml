@@ -23,6 +23,29 @@
     # Each use case script deploys/removes waypoints as needed (L7 on demand).
     # This keeps the baseline lightweight (L4 only via ztunnel).
 
+    - name: Create PodMonitor for waypoints (metrics for Kiali graph)
+      kubernetes.core.k8s:
+        context: "{{ k8s_context }}"
+        state: present
+        definition:
+          apiVersion: monitoring.coreos.com/v1
+          kind: PodMonitor
+          metadata:
+            name: istio-waypoints-monitor
+            namespace: "{{ app_ns }}"
+            labels:
+              k8s-app: waypoint-monitor
+              openshift.io/user-monitoring: "true"
+          spec:
+            selector:
+              matchExpressions:
+                - key: gateway.networking.k8s.io/gateway-name
+                  operator: Exists
+            podMetricsEndpoints:
+              - path: /stats/prometheus
+                portNumber: 15020
+                interval: 15s
+
     - name: Deploy Full Bookinfo Stack
       kubernetes.core.k8s:
         context: "{{ k8s_context }}"

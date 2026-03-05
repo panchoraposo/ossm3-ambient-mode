@@ -30,18 +30,7 @@ oc --context west logs -n ztunnel ds/ztunnel --tail=5 | grep -o 'spiffe://[^"]*'
 
 Expected: both show `spiffe://cluster.local/...` (same trust domain `cluster.local`).
 
-### 2. Verify multi-cluster enabled with cluster IDs
-
-```bash
-oc --context east get istio default -n istio-system -o jsonpath='{.spec.values.global.multiCluster}'
-oc --context west get istio default -n istio-system -o jsonpath='{.spec.values.global.multiCluster}'
-```
-
-Expected:
-- EAST: `{"clusterName":"east","enabled":true}`
-- WEST: `{"clusterName":"west","enabled":true}`
-
-### 3. Verify remote secrets (cross-cluster API access)
+### 2. Verify remote secrets (cross-cluster API access)
 
 Each cluster holds a remote secret with the kubeconfig of the other, allowing istiod to discover remote endpoints.
 
@@ -54,18 +43,20 @@ Expected:
 - EAST has `istio-remote-secret-west`
 - WEST has `istio-remote-secret-east`
 
-### 4. Verify network topology
+### 3. Verify multi-cluster enabled with cluster IDs
 
 ```bash
-oc --context east get ns istio-system -o jsonpath='{.metadata.labels.topology\.istio\.io/network}'
-oc --context west get ns istio-system -o jsonpath='{.metadata.labels.topology\.istio\.io/network}'
+oc --context east get istio default -n istio-system -o jsonpath='{.spec.values.global.multiCluster}'
+oc --context west get istio default -n istio-system -o jsonpath='{.spec.values.global.multiCluster}'
 ```
 
-Expected: EAST = `network1`, WEST = `network2`.
+Expected:
+- EAST: `{"clusterName":"east","enabled":true}`
+- WEST: `{"clusterName":"west","enabled":true}`
 
-### 5. Verify east-west gateways
+### 4. Verify east-west gateways
 
-The east-west gateways enable cross-network traffic between clusters.
+The east-west gateways allow each istiod to reach the remote cluster's API server for service discovery. They handle **control plane** connectivity, not user data plane traffic.
 
 ```bash
 oc --context east get pods -n istio-system | grep eastwest
@@ -74,18 +65,18 @@ oc --context west get pods -n istio-system | grep eastwest
 
 Expected: `Running` in both clusters.
 
-### 6. Verify automatic service discovery
+### 5. Verify automatic service discovery
 
-Services labeled `istio.io/global=true` are automatically discovered across clusters.
+In multi-primary with remote secrets, istiod discovers all services from the remote cluster automatically — no special labels needed.
 
 ```bash
-oc --context east get svc -n bookinfo -l istio.io/global=true -o custom-columns='NAME:.metadata.name'
-oc --context west get svc -n bookinfo -l istio.io/global=true -o custom-columns='NAME:.metadata.name'
+oc --context east get svc -n bookinfo
+oc --context west get svc -n bookinfo
 ```
 
 Expected: `details`, `productpage`, `ratings`, `reviews` on both clusters.
 
-### 7. Verify in Kiali
+### 6. Verify in Kiali
 
 Open Kiali from the ACM console:
 
@@ -93,8 +84,7 @@ https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/
 
 - Select namespace `bookinfo`
 - Both clusters (EAST and WEST) should appear in the graph
-- Services from both clusters should be visible in the service list
-- Traffic edges should show cross-cluster communication when traffic is flowing
+- Services from both clusters are discovered and visible
 
 ## Expected Results
 
@@ -104,7 +94,6 @@ https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/
 | Cluster ID | `east` | `west` |
 | Multi-cluster enabled | `true` | `true` |
 | Remote secret | `istio-remote-secret-west` | `istio-remote-secret-east` |
-| Network | `network1` | `network2` |
 | East-west gateway | Running | Running |
 | Services discoverable | details, productpage, ratings, reviews | details, productpage, ratings, reviews |
 | Kiali graph | Shows both clusters | Shows both clusters |
@@ -116,9 +105,9 @@ https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/
 | Shared trust domain (`cluster.local`) | Unified identity across clusters | Yes — mTLS / SPIFFE |
 | Remote secrets | Cross-cluster API access for istiod | Yes — control plane federation |
 | istiod (per cluster) | Discovers remote endpoints, pushes config | Yes — control plane |
-| East-west gateways | Cross-network connectivity (HBONE) | Yes — data plane |
+| East-west gateways | Cross-cluster connectivity for control plane federation | Yes — control plane |
 | Kiali (ACM) | Unified visualization of both clusters | Yes — mesh observability |
-| `istio.io/global=true` label | Marks services for cross-cluster discovery | Yes — service discovery |
+| Remote secrets + istiod | Automatic cross-cluster service discovery | Yes — service discovery |
 
 ## Key Takeaway
 

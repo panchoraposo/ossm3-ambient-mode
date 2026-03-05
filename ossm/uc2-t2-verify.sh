@@ -20,6 +20,20 @@ KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatwo
 
 ERRORS=0
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
+cleanup() {
+  oc --context east delete authorizationpolicy reviews-deny-external -n bookinfo 2>/dev/null
+  oc --context east delete authorizationpolicy reviews-allow-by-identity -n bookinfo 2>/dev/null
+  oc --context east label svc reviews -n bookinfo istio.io/use-waypoint- 2>/dev/null
+  oc --context east delete gateway reviews-waypoint -n bookinfo 2>/dev/null
+}
+trap cleanup EXIT
+
 header() {
   echo ""
   echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -38,9 +52,9 @@ check_page() {
   local expect_reviews_error="$3"
 
   local html
-  html=$(curl -s -m 15 "${url}/productpage" 2>/dev/null)
+  html=$(curl -s -m 20 --retry 2 --retry-delay 3 "${url}/productpage" 2>/dev/null)
   local http_code
-  http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 15 "${url}/productpage" 2>/dev/null)
+  http_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "${url}/productpage" 2>/dev/null)
 
   echo -e "  ${label}: HTTP ${BOLD}${http_code}${RESET}"
 
@@ -125,8 +139,34 @@ section "Both Routes should serve reviews normally"
 check_page "Original (bookinfo)" "$EAST_ROUTE" "false"
 check_page "External (bookinfo-external)" "$EXTERNAL_ROUTE" "false"
 
-# ── Phase 3: DENY external namespace ─────────────────────────────────────
-header "3. Apply AuthorizationPolicy — DENY bookinfo-external"
+# ── Phase 3: Deploy reviews-waypoint ─────────────────────────────────────
+header "3. Deploy reviews-waypoint (L7 proxy for AuthorizationPolicy)"
+
+oc --context east apply -f - <<EOF 2>/dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reviews-waypoint
+  namespace: bookinfo
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+echo -e "  ${PASS} Gateway ${GREEN}reviews-waypoint${RESET} created"
+oc --context east label svc reviews -n bookinfo istio.io/use-waypoint=reviews-waypoint --overwrite 2>/dev/null
+echo -e "  ${PASS} Service reviews labeled with ${GREEN}istio.io/use-waypoint=reviews-waypoint${RESET}"
+oc --context east wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n bookinfo --timeout=60s 2>/dev/null
+echo -e "  ${PASS} Waypoint pod ${GREEN}Ready${RESET}"
+
+pause "Press ENTER to apply DENY policy..."
+
+# ── Phase 4: DENY external namespace ─────────────────────────────────────
+header "4. Apply AuthorizationPolicy — DENY bookinfo-external"
 
 oc --context east apply -f - <<'EOF' &>/dev/null
 apiVersion: security.istio.io/v1
@@ -175,10 +215,10 @@ echo -e "  ${CYAN}  Original:  ${EAST_ROUTE}/productpage  → reviews work${RESE
 echo -e "  ${CYAN}  External:  ${EXTERNAL_ROUTE}/productpage  → reviews DENIED${RESET}"
 echo -e "  ${CYAN}  Kiali:     ${KIALI_URL}${RESET}"
 echo ""
-read -rp "  Press ENTER to continue to Phase 4 (ALLOW by identity)..."
+pause "Press ENTER to continue to Phase 5 (ALLOW by identity)..."
 
-# ── Phase 4: ALLOW with explicit identities ──────────────────────────────
-header "4. Switch to ALLOW — Authorize both ServiceAccounts"
+# ── Phase 5: ALLOW with explicit identities ──────────────────────────────
+header "5. Switch to ALLOW — Authorize both ServiceAccounts"
 
 oc --context east delete authorizationpolicy reviews-deny-external -n bookinfo &>/dev/null
 oc --context east apply -f - <<'EOF' &>/dev/null
@@ -211,13 +251,14 @@ check_page "External (bookinfo-external)" "$EXTERNAL_ROUTE" "false"
 echo ""
 echo -e "  ${CYAN}${BOLD}▶ Verify in browser: both URLs now show reviews${RESET}"
 echo ""
-read -rp "  Press ENTER to continue to cleanup..."
+pause "Press ENTER to cleanup..."
 
 # ── Phase 5: Cleanup ─────────────────────────────────────────────────────
-header "5. Cleanup"
+header "6. Cleanup"
 
 oc --context east delete authorizationpolicy reviews-allow-by-identity -n bookinfo &>/dev/null
 echo -e "  ${PASS} AuthorizationPolicy ${GREEN}removed${RESET}"
+echo -e "  (Waypoint removed automatically on exit via trap)"
 
 sleep 3
 

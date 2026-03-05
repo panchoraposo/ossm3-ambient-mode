@@ -51,7 +51,32 @@ curl -s -o /dev/null -w "%{http_code}" http://bookinfo-external.apps.cluster-64k
 
 Expected: both return HTTP 200 with Book Details and Book Reviews.
 
-### Phase 3: Apply AuthorizationPolicy (DENY external)
+### Phase 3: Deploy reviews-waypoint (L7 proxy)
+
+The AuthorizationPolicy with `targetRefs` requires a waypoint proxy to enforce L7 policies. Deploy it on demand:
+
+```bash
+oc --context east apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reviews-waypoint
+  namespace: bookinfo
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+
+oc --context east label svc reviews -n bookinfo istio.io/use-waypoint=reviews-waypoint --overwrite
+oc --context east wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n bookinfo --timeout=60s
+```
+
+### Phase 4: Apply AuthorizationPolicy (DENY external)
 
 ```bash
 oc --context east apply -f - <<EOF
@@ -80,7 +105,7 @@ Expected:
 - **Original bookinfo**: HTTP 200 — Book Details + Book Reviews (works)
 - **External**: HTTP 200 — Book Details OK, **Error fetching product reviews** (denied)
 
-### Phase 4: Switch to ALLOW with both identities
+### Phase 5: Switch to ALLOW with both identities
 
 ```bash
 oc --context east delete authorizationpolicy reviews-deny-external -n bookinfo
@@ -107,10 +132,12 @@ EOF
 
 Expected: both Routes return HTTP 200 with Book Details + Book Reviews.
 
-### Phase 5: Cleanup
+### Phase 6: Cleanup
 
 ```bash
 oc --context east delete authorizationpolicy reviews-allow-by-identity -n bookinfo
+oc --context east label svc reviews -n bookinfo istio.io/use-waypoint-
+oc --context east delete gateway reviews-waypoint -n bookinfo
 ```
 
 ## Expected Results

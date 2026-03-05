@@ -15,6 +15,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
 CTX="east"
@@ -35,6 +41,8 @@ section() {
 cleanup() {
   oc --context "$CTX" delete httproute reviews-mirror -n "$NS" 2>/dev/null
   oc --context "$CTX" delete svc reviews-v2-mirror -n "$NS" 2>/dev/null
+  oc --context "$CTX" label svc reviews -n "$NS" istio.io/use-waypoint- 2>/dev/null
+  oc --context "$CTX" delete gateway reviews-waypoint -n "$NS" 2>/dev/null
 }
 
 trap cleanup EXIT
@@ -43,7 +51,7 @@ trap cleanup EXIT
 header "UC20-T6: Traffic Mirroring — HTTPRoute"
 
 section "1. Verify bookinfo is accessible"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET}"
 else
@@ -57,12 +65,35 @@ echo -e "  ${PASS} productpage pod: ${BOLD}${PRODUCTPAGE_POD}${RESET}"
 
 echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
 echo -e "  → Kiali graph: ${BOLD}${KIALI_URL}${RESET}"
-read -rp "  ⏎ Press ENTER to configure traffic mirroring..." _
+pause "Press ENTER to deploy waypoint and configure mirroring..."
+
+# ── Deploy reviews-waypoint ──────────────────────────────────────────
+section "2. Deploy reviews-waypoint (L7 proxy for HTTPRoute mirror)"
+oc --context "$CTX" apply -f - <<EOF 2>/dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reviews-waypoint
+  namespace: $NS
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+echo -e "  ${PASS} Gateway ${GREEN}reviews-waypoint${RESET} created"
+oc --context "$CTX" label svc reviews -n "$NS" istio.io/use-waypoint=reviews-waypoint --overwrite 2>/dev/null
+echo -e "  ${PASS} Service reviews labeled with ${GREEN}istio.io/use-waypoint=reviews-waypoint${RESET}"
+oc --context "$CTX" wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n "$NS" --timeout=60s 2>/dev/null
+echo -e "  ${PASS} Waypoint pod ${GREEN}Ready${RESET}"
 
 # ── Create mirror service + apply HTTPRoute ──────────────────────────
 header "Phase: Configure Traffic Mirroring"
 
-section "2. Create mirror target service + HTTPRoute with requestMirror"
+section "3. Create mirror target service + HTTPRoute with requestMirror"
 oc --context "$CTX" apply -f - <<'EOF'
 apiVersion: v1
 kind: Service
@@ -104,10 +135,10 @@ echo -e "  Waiting 15s for config propagation..."
 sleep 15
 
 # ── Send traffic ────────────────────────────────────────────────────
-section "3. Send traffic to generate mirror copies"
+section "4. Send traffic to generate mirror copies"
 echo -e "  Sending 8 requests through the Route..."
 for i in $(seq 1 8); do
-  curl -s -o /dev/null -w "%{http_code} " -m 10 "$EAST_ROUTE"
+  curl -s -o /dev/null -w "%{http_code} " -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE"
   sleep 1
 done
 echo ""
@@ -127,7 +158,7 @@ done
 sleep 5
 
 # ── Verify via waypoint stats ────────────────────────────────────────
-section "4. Verify mirror traffic via waypoint Envoy stats"
+section "5. Verify mirror traffic via waypoint Envoy stats"
 REVIEWS_WP=$(oc --context "$CTX" get pod -n "$NS" \
   -l gateway.networking.k8s.io/gateway-name=reviews-waypoint \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
@@ -149,7 +180,7 @@ else
 fi
 
 # ── Verify via ztunnel logs ──────────────────────────────────────────
-section "5. Verify mirror traffic via ztunnel logs"
+section "6. Verify mirror traffic via ztunnel logs"
 ZTUNNEL_POD=$(oc --context "$CTX" get pods -n ztunnel -l app=ztunnel \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
@@ -168,18 +199,18 @@ fi
 
 echo ""
 echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET} (should show mirrored traffic to reviews-v2-mirror)"
-read -rp "  ⏎ Press ENTER to cleanup..." _
+pause "Press ENTER to cleanup..."
 
 # ── Cleanup ──────────────────────────────────────────────────────────
-section "6. Cleanup"
+section "7. Cleanup"
 trap - EXIT
 cleanup
 echo -e "  ${PASS} Resources deleted"
 sleep 5
 
 # ── Recovery ─────────────────────────────────────────────────────────
-section "7. Verify recovery"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+section "8. Verify recovery"
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET} — normal operation restored"
 else

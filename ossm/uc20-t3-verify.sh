@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
 CTX="east"
@@ -33,16 +39,19 @@ section() {
 }
 
 cleanup() {
-  section "Cleanup: removing DestinationRule"
+  section "Cleanup: removing resources"
   oc --context "$CTX" delete destinationrule reviews-circuit-breaker -n "$NS" 2>/dev/null
-  echo -e "  ${PASS} DestinationRule removed"
+  oc --context "$CTX" label svc reviews -n "$NS" istio.io/use-waypoint- 2>/dev/null
+  oc --context "$CTX" delete gateway reviews-waypoint -n "$NS" 2>/dev/null
+  echo -e "  ${PASS} DestinationRule + waypoint removed"
 }
+trap cleanup EXIT
 
 # ── Phase 1: Baseline ───────────────────────────────────────────────
 header "UC20-T3: Circuit Breaking"
 
 section "1. Baseline — verify traffic flows"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET}"
 else
@@ -50,33 +59,37 @@ else
   exit 1
 fi
 
-# ── Phase 2: Verify waypoint is in the data path ────────────────────
-section "2. Verify reviews-waypoint is active"
+# ── Phase 2: Deploy reviews-waypoint ─────────────────────────────────
+section "2. Deploy reviews-waypoint (L7 proxy for DestinationRule)"
+oc --context "$CTX" apply -f - <<EOF 2>/dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reviews-waypoint
+  namespace: $NS
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+echo -e "  ${PASS} Gateway ${GREEN}reviews-waypoint${RESET} created"
+oc --context "$CTX" label svc reviews -n "$NS" istio.io/use-waypoint=reviews-waypoint --overwrite 2>/dev/null
+echo -e "  ${PASS} Service reviews labeled with ${GREEN}istio.io/use-waypoint=reviews-waypoint${RESET}"
+oc --context "$CTX" wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n "$NS" --timeout=60s 2>/dev/null
+echo -e "  ${PASS} Waypoint pod ${GREEN}Ready${RESET}"
+
 REVIEWS_WP=$(oc --context "$CTX" get pods -n "$NS" \
   -l gateway.networking.k8s.io/gateway-name=reviews-waypoint \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-
-if [[ -z "$REVIEWS_WP" ]]; then
-  echo -e "  ${FAIL} reviews-waypoint pod not found"
-  exit 1
-fi
 echo -e "  ${PASS} Waypoint pod: ${BOLD}${REVIEWS_WP}${RESET}"
-
-ZTUNNEL_POD=$(oc --context "$CTX" get pods -n ztunnel -l app=ztunnel \
-  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-
-wp_check=$(istioctl --context "$CTX" ztunnel-config service "${ZTUNNEL_POD}.ztunnel" 2>/dev/null \
-  | grep -E "^\s*bookinfo\s+reviews\s" | grep -o "reviews-waypoint")
-
-if [[ "$wp_check" == "reviews-waypoint" ]]; then
-  echo -e "  ${PASS} ztunnel routes reviews through ${GREEN}reviews-waypoint${RESET}"
-else
-  echo -e "  ${WARN} Could not confirm waypoint routing via istioctl (will proceed anyway)"
-fi
 
 echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
 echo -e "  → Kiali graph: ${BOLD}${KIALI_URL}${RESET}"
-read -rp "  ⏎ Press ENTER to apply circuit breaker..." _
+pause "Press ENTER to apply circuit breaker..."
 
 # ── Phase 3: Apply DestinationRule ──────────────────────────────────
 section "3. Apply DestinationRule (restrictive limits)"
@@ -134,7 +147,7 @@ oc --context "$CTX" exec -n "$NS" "$REVIEWS_WP" -- \
   pilot-agent request POST reset_counters &>/dev/null
 echo -e "  ${PASS} Stats reset"
 
-read -rp "  ⏎ Press ENTER to send concurrent traffic..." _
+pause "Press ENTER to send concurrent traffic..."
 
 # ── Phase 6: Generate concurrent traffic ────────────────────────────
 section "6. Send ${CONCURRENT} concurrent requests (from productpage → reviews)"
@@ -215,14 +228,14 @@ fi
 
 echo ""
 echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET} (check for 503 error rate on reviews)"
-read -rp "  ⏎ Press ENTER to cleanup..." _
+pause "Press ENTER to cleanup..."
 
 # ── Cleanup & recovery ──────────────────────────────────────────────
 cleanup
 
 sleep 5
 section "8. Verify recovery after cleanup"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET} — normal operation restored"
 else

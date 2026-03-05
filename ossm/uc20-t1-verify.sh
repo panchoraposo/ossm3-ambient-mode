@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
 CTX="east"
@@ -34,6 +40,13 @@ section() {
 cleanup_vs() {
   oc --context "$CTX" delete virtualservice reviews-fault-inject -n "$NS" 2>/dev/null
 }
+
+cleanup_all() {
+  cleanup_vs
+  oc --context "$CTX" label svc reviews -n "$NS" istio.io/use-waypoint- 2>/dev/null
+  oc --context "$CTX" delete gateway reviews-waypoint -n "$NS" 2>/dev/null
+}
+trap cleanup_all EXIT
 
 PRODUCTPAGE_POD=""
 
@@ -61,7 +74,7 @@ except Exception as e:
 header "UC20-T1: Fault Injection (Delay & Abort)"
 
 section "1. Baseline — verify bookinfo and productpage pod"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET}"
 else
@@ -98,12 +111,35 @@ else
   exit 1
 fi
 
-read -rp "  ⏎ Press ENTER to inject fault abort (HTTP 500)..." _
+pause "Press ENTER to deploy waypoint and inject faults..."
+
+# ── Deploy reviews-waypoint ──────────────────────────────────────────
+section "3. Deploy reviews-waypoint (L7 proxy for VirtualService)"
+oc --context "$CTX" apply -f - <<EOF 2>/dev/null
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: reviews-waypoint
+  namespace: $NS
+  labels:
+    istio.io/waypoint-for: service
+spec:
+  gatewayClassName: istio-waypoint
+  listeners:
+    - name: mesh
+      port: 15008
+      protocol: HBONE
+EOF
+echo -e "  ${PASS} Gateway ${GREEN}reviews-waypoint${RESET} created"
+oc --context "$CTX" label svc reviews -n "$NS" istio.io/use-waypoint=reviews-waypoint --overwrite 2>/dev/null
+echo -e "  ${PASS} Service reviews labeled with ${GREEN}istio.io/use-waypoint=reviews-waypoint${RESET}"
+oc --context "$CTX" wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n "$NS" --timeout=60s 2>/dev/null
+echo -e "  ${PASS} Waypoint pod ${GREEN}Ready${RESET}"
 
 # ── Phase A: Abort ──────────────────────────────────────────────────
 header "Phase A: Fault Abort (HTTP 500)"
 
-section "3. Apply VirtualService — abort 100% with HTTP 500"
+section "4. Apply VirtualService — abort 100% with HTTP 500"
 cleanup_vs
 oc --context "$CTX" apply -f - <<'EOF'
 apiVersion: networking.istio.io/v1
@@ -127,7 +163,7 @@ EOF
 echo -e "  ${PASS} VirtualService applied (abort)"
 sleep 10
 
-section "4. Test abort — expect HTTP 500"
+section "5. Test abort — expect HTTP 500"
 abort_result=$(call_reviews)
 a_status=$(echo "$abort_result" | cut -d'|' -f1)
 a_elapsed=$(echo "$abort_result" | cut -d'|' -f2)
@@ -143,14 +179,14 @@ fi
 
 echo ""
 echo -e "  → Refresh browser: ${BOLD}${EAST_ROUTE}${RESET} (should show 'Error fetching product reviews')"
-echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET} (red edges on reviews)"
+echo -e "  → Kiali: ${BOLD}${KIALI_URL}${RESET} (observe traffic flow on reviews)"
 echo -e "  → Try: ${CYAN}curl -s -o /dev/null -w '%{http_code}' ${EAST_ROUTE}${RESET}"
-read -rp "  ⏎ Press ENTER to switch to fault delay (5s)..." _
+pause "Press ENTER to switch to fault delay (5s)..."
 
 # ── Phase B: Delay ──────────────────────────────────────────────────
 header "Phase B: Fault Delay (5 seconds)"
 
-section "5. Apply VirtualService — delay 100% for 5s"
+section "6. Apply VirtualService — delay 100% for 5s"
 cleanup_vs
 echo -e "  Waiting for abort cleanup to propagate..."
 sleep 15
@@ -177,7 +213,7 @@ echo -e "  ${PASS} VirtualService applied (delay 5s)"
 echo -e "  Waiting for config propagation..."
 sleep 15
 
-section "6. Test delay — expect ~5s response time"
+section "7. Test delay — expect ~5s response time"
 for attempt in 1 2; do
   delay_result=$(call_reviews)
   d_status=$(echo "$delay_result" | cut -d'|' -f1)
@@ -206,7 +242,7 @@ done
 echo ""
 echo -e "  → Refresh browser: ${BOLD}${EAST_ROUTE}${RESET} (page loads slowly ~5s)"
 echo -e "  → Try: ${CYAN}curl -s -o /dev/null -w 'HTTP %%{http_code} in %%{time_total}s' ${EAST_ROUTE}${RESET}"
-read -rp "  ⏎ Press ENTER to cleanup..." _
+pause "Press ENTER to cleanup..."
 
 # ── Cleanup ──────────────────────────────────────────────────────────
 cleanup_vs
@@ -239,8 +275,8 @@ else
 fi
 
 sleep 5
-section "7. Verify recovery after cleanup"
-east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
+section "8. Verify recovery after cleanup"
+east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
 if [[ "$east_code" == "200" ]]; then
   echo -e "  ${PASS} EAST: ${GREEN}HTTP ${east_code}${RESET} — normal operation restored"
 else

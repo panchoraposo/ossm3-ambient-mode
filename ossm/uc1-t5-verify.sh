@@ -14,6 +14,12 @@ PASS="${GREEN}✔${RESET}"
 FAIL="${RED}✘${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
+pause() {
+  echo ""
+  echo -e "  ${CYAN}╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶╶${RESET}"
+  read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
+}
+
 EAST_ROUTE="http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage"
 WEST_ROUTE="http://bookinfo.apps.cluster-7rt9h.7rt9h.sandbox1900.opentlc.com/productpage"
 KIALI_URL="https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph"
@@ -53,8 +59,8 @@ check_istiod() {
 test_traffic() {
   local label="$1"
   section "Traffic test: ${label}"
-  east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$EAST_ROUTE" 2>/dev/null)
-  west_code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "$WEST_ROUTE" 2>/dev/null)
+  east_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$EAST_ROUTE" 2>/dev/null)
+  west_code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 --retry 2 --retry-delay 3 "$WEST_ROUTE" 2>/dev/null)
   [[ -z "$east_code" || "$east_code" == "000" ]] && east_code="TIMEOUT"
   [[ -z "$west_code" || "$west_code" == "000" ]] && west_code="TIMEOUT"
 
@@ -82,7 +88,7 @@ echo -e "  → Open in browser: ${BOLD}${EAST_ROUTE}${RESET}"
 echo -e "  → Open in browser: ${BOLD}${WEST_ROUTE}${RESET}"
 check_istiod "before failure"
 test_traffic "before failure"
-read -rp "  ⏎ Press ENTER to simulate control plane failure..." _
+pause "Press ENTER to simulate control plane failure..."
 
 # Step 2: Kill istiod in EAST
 header "2. Simulate Control Plane Failure in EAST"
@@ -102,7 +108,7 @@ echo ""
 echo -e "  ${CYAN}${BOLD}▶ istiod EAST is DOWN — check Kiali to verify traffic still flows${RESET}"
 echo -e "  ${CYAN}  ${KIALI_URL}${RESET}"
 echo ""
-read -rp "  Press ENTER to restore istiod and continue..."
+pause "Press ENTER to restore istiod and continue..."
 
 # Step 4: Restore istiod
 header "4. Restore istiod in EAST"
@@ -125,6 +131,6 @@ echo -e "  Before           Running         HTTP 200        HTTP 200"
 echo -e "  istiod down      ${RED}${BOLD}0 pods${RESET}          ${GREEN}${BOLD}HTTP 200${RESET}        ${GREEN}${BOLD}HTTP 200${RESET}"
 echo -e "  Restored         Running         HTTP 200        HTTP 200"
 echo ""
-echo -e "  ${BOLD}Why:${RESET} ztunnel and waypoints keep their config in memory."
-echo -e "  Losing istiod = no new config updates, but existing traffic is unaffected."
+echo -e "  ${BOLD}Why:${RESET} ztunnel (and waypoints, if deployed) keep their config in memory."
+echo -e "  Losing istiod = no new config updates, but existing data-plane traffic is unaffected."
 echo ""
