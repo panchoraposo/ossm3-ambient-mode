@@ -1,6 +1,6 @@
-# oc login en cada nodo (acm + 2 ocp)
+# oc login en cada nodo (acm2 + 2 ocp)
 # oc config get-contexts
-# oc config rename-context default/api-cluster-*****-dynamic-redhatworkshops-io:6443/admin acm (luego de acm, hacer east y west)
+# oc config rename-context default/api-... acm2 (luego, hacer east2 y west2)
 # python3 -m venv venv
 # source venv/bin/activate   
 # python3 -m pip install -r requirements.txt  

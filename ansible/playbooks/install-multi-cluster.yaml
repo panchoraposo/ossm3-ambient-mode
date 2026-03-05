@@ -101,7 +101,7 @@
   connection: local
   gather_facts: false
   vars:
-    ctx_acm: "acm"
+    ctx_acm: "{{ hostvars['acm'].k8s_context | default('acm2') }}"
   tasks:
     - name: Discover tracing endpoints (role)
       import_role:

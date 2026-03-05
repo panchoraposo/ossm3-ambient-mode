@@ -3,13 +3,13 @@ all:
     clusters:
       hosts:
         east:
-          k8s_context: east
+          k8s_context: east2
           cluster_network: network1
           mesh_id: mesh1
           tempo_distributor_service: "tempo-tempo-distributor.istio-system.svc.cluster.local"
 
         west:
-          k8s_context: west
+          k8s_context: west2
           cluster_network: network2
           mesh_id: mesh1
           tempo_distributor_service: "tempo-tempo-distributor.istio-system.svc.cluster.local"
@@ -17,7 +17,7 @@ all:
       hosts:
         # ACM hub cluster (used for central observability + Kiali multicluster)
         acm:
-          k8s_context: acm
+          k8s_context: acm2
   vars:
     ansible_connection: local
     ansible_python_interpreter: python3

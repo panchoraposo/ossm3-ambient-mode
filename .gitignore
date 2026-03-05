@@ -20,7 +20,12 @@
 ansible/venv/
 venv/
 .venv/
+.cache/
 
 # Local/demo artifacts (do not commit)
 token*.yaml
 token-for-*.yaml
+
+# Local artifacts from GLB / experiments
+delegation-record*.json
+secret-*.yaml

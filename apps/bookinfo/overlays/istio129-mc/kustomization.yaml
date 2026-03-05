@@ -1,0 +1,79 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base-istio129
+  - namespace.yaml
+  - destinationrule-failover.yaml
+  - httproute.yaml
+  - route.yaml
+
+patches:
+  # Keep ingress gateway as ClusterIP (OpenShift Route exposes it)
+  - target:
+      kind: Gateway
+      name: bookinfo-gateway
+    patch: |-
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: bookinfo-gateway
+        annotations:
+          networking.istio.io/service-type: ClusterIP
+
+  # Enroll services to use their per-service waypoint (L7)
+  - target: { kind: Service, name: productpage }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: productpage
+        labels:
+          istio.io/use-waypoint: productpage-waypoint
+          istio.io/global: "true"
+
+  - target: { kind: Service, name: reviews }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: reviews
+        labels:
+          istio.io/use-waypoint: reviews-waypoint
+          istio.io/global: "true"
+
+  - target: { kind: Service, name: ratings }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ratings
+        labels:
+          istio.io/use-waypoint: ratings-waypoint
+          istio.io/global: "true"
+
+  - target: { kind: Service, name: details }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: details
+        labels:
+          istio.io/use-waypoint: details-waypoint
+          istio.io/global: "true"
+
+  # Ensure productpage workload is also labeled (ingress->ambient HBONE handling)
+  - target:
+      kind: Deployment
+      name: productpage-v1
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: productpage-v1
+      spec:
+        template:
+          metadata:
+            labels:
+              istio.io/use-waypoint: productpage-waypoint
+

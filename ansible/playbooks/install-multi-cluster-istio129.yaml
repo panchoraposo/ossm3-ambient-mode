@@ -1,0 +1,96 @@
+---
+- name: Phase 0 - Ensure local Python dependencies for Ansible modules
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    deps:
+      - kubernetes
+      - openshift
+      - PyYAML
+      - jmespath
+  tasks:
+    - name: Install required Python packages (best effort)
+      ansible.builtin.command: >-
+        {{ ansible_playbook_python }} -m pip install -q {{ deps | join(' ') }}
+      register: pip_install
+      changed_when: pip_install.rc == 0
+      failed_when: false
+
+    - name: Install required Python packages (allow system site-packages)
+      when: pip_install.rc != 0
+      ansible.builtin.command: >-
+        {{ ansible_playbook_python }} -m pip install -q --break-system-packages {{ deps | join(' ') }}
+
+- name: Phase 0.5 - Scale worker MachineSets (east2 + west2)
+  hosts: clusters
+  gather_facts: false
+  tasks:
+    - name: Scale worker MachineSets (role)
+      import_role:
+        name: machineset-scale
+
+- name: Phase 0.6 - Preflight pod capacity (east2 + west2)
+  hosts: clusters
+  gather_facts: false
+  tasks:
+    - name: Pod capacity preflight (role)
+      import_role:
+        name: pod-capacity-preflight
+
+- name: Phase 1 - Install Istio upstream 1.29 (ambient, multi-cluster)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ctx_east: "{{ hostvars['east'].k8s_context | default('east2') }}"
+    ctx_west: "{{ hostvars['west'].k8s_context | default('west2') }}"
+    repo_root: "{{ playbook_dir }}/../.."
+  tasks:
+    - name: Run upstream Istio installer script (east2/west2)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        CTX_EAST="{{ ctx_east }}" CTX_WEST="{{ ctx_west }}" ISTIO_VERSION="{{ istio_version | default('1.29.0') }}" \
+          "{{ repo_root }}/scripts/istio129/install.sh"
+      args:
+        chdir: "{{ repo_root }}"
+
+- name: Phase 2 - Install Connectivity Link + Kuadrant on data clusters
+  hosts: clusters
+  gather_facts: false
+  vars_files:
+    - ../vars/demo.yaml
+  roles:
+    - role: cluster-observability
+    - role: nfl-wallet
+    - role: connectivity-link
+
+- name: Phase 3 - Deploy Bookinfo application (waypoints + traffic split + failover DR)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ctx_east: "{{ hostvars['east'].k8s_context | default('east2') }}"
+    ctx_west: "{{ hostvars['west'].k8s_context | default('west2') }}"
+    repo_root: "{{ playbook_dir }}/../.."
+  tasks:
+    - name: Deploy Bookinfo overlay for Istio 1.29 (east2/west2)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        CTX_EAST="{{ ctx_east }}" CTX_WEST="{{ ctx_west }}" "{{ repo_root }}/scripts/istio129/deploy-bookinfo.sh"
+      args:
+        chdir: "{{ repo_root }}"
+
+- name: Phase 4 - (Optional) Hub observability on acm2
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ctx_acm: "{{ hostvars['acm'].k8s_context | default('acm2') }}"
+  tasks:
+    - name: Print optional hub observability command
+      ansible.builtin.debug:
+        msg: >-
+          Optional: CTX_ACM={{ ctx_acm }} CTX_EAST={{ hostvars['east'].k8s_context | default('east2') }}
+          CTX_WEST={{ hostvars['west'].k8s_context | default('west2') }} ./scripts/istio129/install-acm2-observability.sh
+
