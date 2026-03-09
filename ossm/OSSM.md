@@ -358,3 +358,5 @@ For most use cases, run `generate-traffic.sh` in a separate terminal before star
 | UC2-T4 | mTLS Enforcement (PeerAuthentication STRICT) | Security |
 | UC12 | Blue/Green Deployment with Gateway API | Traffic management |
 | UC13 | Local-First Traffic Awareness | Routing / observability |
+| UC9 | Special Case of Custom Certificate | Egress / TLS |
+| UC11 | Special Ciphers (Legacy TLS Origination; Istio-only + Kuadrant option) | Egress / TLS + API mgmt |
