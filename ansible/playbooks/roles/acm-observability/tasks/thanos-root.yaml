@@ -89,7 +89,7 @@
           {% for c in promxy_clusters %}
               - static_configs:
                   - targets:
-                      - {{ thanos_route_host_by_cluster[c] }}
+                      - {{ thanos_route_host_by_cluster[c] }}:443
                 # If a managed cluster is temporarily unreachable from the hub
                 # network (common in demo envs), keep serving partial results.
                 ignore_error: true
