@@ -184,13 +184,22 @@ section "6. Verify mirror traffic via ztunnel logs"
 ZTUNNEL_POD=$(oc --context "$CTX" get pods -n ztunnel -l app=ztunnel \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
-v2_conns=$(oc --context "$CTX" logs "$ZTUNNEL_POD" -n ztunnel --tail=80 2>/dev/null \
-  | grep "reviews-v2-mirror" | wc -l | tr -d ' ')
+echo -e "  Waiting 30s for mirror connections to complete and appear in ztunnel logs..."
+sleep 30
+
+mirror_logs=$(oc --context "$CTX" logs "$ZTUNNEL_POD" -n ztunnel --tail=500 2>/dev/null \
+  | grep "reviews-v2-mirror")
+v2_conns=$(echo "$mirror_logs" | grep -c "reviews-v2-mirror" 2>/dev/null || echo 0)
 
 echo -e "  ztunnel → reviews-v2-mirror: ${BOLD}${v2_conns}${RESET} connections"
 
 if [[ "$v2_conns" -gt 0 ]]; then
   echo -e "  ${PASS} ${GREEN}Mirror traffic confirmed in ztunnel logs${RESET}"
+  echo ""
+  echo -e "  ${CYAN}Sample ztunnel log entry:${RESET}"
+  echo "$mirror_logs" | head -1 | sed 's/.*src.workload=/  src.workload=/' | fold -s -w 100 | while IFS= read -r line; do
+    echo -e "  ${CYAN}${line}${RESET}"
+  done
   test_ztunnel="pass"
 else
   echo -e "  ${WARN} No mirror connections found in recent ztunnel logs (may have scrolled out)"
