@@ -1,5 +1,7 @@
 - name: Install OpenShift GitOps operator
   include_tasks: install-operator.yaml
 
-- name: Deploy Bookinfo GitOps multi-cluster ApplicationSet (east + west)
-  include_tasks: bookinfo-appset.yaml
+# Disabled: bookinfo is deployed directly via apps.yaml (Phase 5), not via ArgoCD.
+# ArgoCD's selfHeal+prune re-adds waypoints from the overlay, conflicting with L4 baseline.
+# - name: Deploy Bookinfo GitOps multi-cluster ApplicationSet (east + west)
+#   include_tasks: bookinfo-appset.yaml
