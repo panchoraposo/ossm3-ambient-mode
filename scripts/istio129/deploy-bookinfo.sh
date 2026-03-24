@@ -14,11 +14,20 @@ require_context "$CTX_WEST"
 download_istioctl
 
 BOOKINFO_NS="${BOOKINFO_NS:-bookinfo}"
+BOOKINFO_WAYPOINTS_ENABLED="${BOOKINFO_WAYPOINTS_ENABLED:-false}"
+
+bookinfo_overlay_dir() {
+  if [[ "${BOOKINFO_WAYPOINTS_ENABLED}" == "true" ]]; then
+    echo "${ROOT_DIR}/apps/bookinfo/overlays/istio129-mc-waypoints"
+  else
+    echo "${ROOT_DIR}/apps/bookinfo/overlays/istio129-mc"
+  fi
+}
 
 apply_bookinfo() {
   local ctx="$1"
   log "Deploying Bookinfo manifests on ${ctx}..."
-  kubectl --context "$ctx" apply -k "${ROOT_DIR}/apps/bookinfo/overlays/istio129-mc" >/dev/null
+  kubectl --context "$ctx" apply -k "$(bookinfo_overlay_dir)" >/dev/null
 }
 
 apply_waypoints() {
@@ -51,8 +60,12 @@ patch_clustername_env() {
 wait_rollout() {
   local ctx="$1"
   log "Waiting for Bookinfo workloads on ${ctx}..."
-  for d in bookinfo-gateway-istio details-v1 productpage-v1 ratings-v1 reviews-v1 reviews-v2 reviews-v3 \
-    productpage-waypoint reviews-waypoint ratings-waypoint details-waypoint; do
+  local deployments=(bookinfo-gateway-istio details-v1 productpage-v1 ratings-v1 reviews-v1 reviews-v2 reviews-v3)
+  if [[ "${BOOKINFO_WAYPOINTS_ENABLED}" == "true" ]]; then
+    deployments+=(productpage-waypoint reviews-waypoint ratings-waypoint details-waypoint)
+  fi
+  local d
+  for d in "${deployments[@]}"; do
     kubectl --context "$ctx" -n "$BOOKINFO_NS" rollout status "deploy/${d}" --timeout=180s >/dev/null
   done
 }
@@ -60,16 +73,19 @@ wait_rollout() {
 main() {
   log "=== Deploy Bookinfo (Istio 1.29 ambient) ==="
   log "Contexts: east=${CTX_EAST}, west=${CTX_WEST}"
+  log "Waypoints enabled: ${BOOKINFO_WAYPOINTS_ENABLED}"
   log ""
 
   apply_bookinfo "$CTX_EAST"
   apply_bookinfo "$CTX_WEST"
 
-  apply_waypoints "$CTX_EAST"
-  apply_waypoints "$CTX_WEST"
+  if [[ "${BOOKINFO_WAYPOINTS_ENABLED}" == "true" ]]; then
+    apply_waypoints "$CTX_EAST"
+    apply_waypoints "$CTX_WEST"
 
-  grant_anyuid_scc "$CTX_EAST"
-  grant_anyuid_scc "$CTX_WEST"
+    grant_anyuid_scc "$CTX_EAST"
+    grant_anyuid_scc "$CTX_WEST"
+  fi
 
   patch_clustername_env "$CTX_EAST" "$CTX_EAST"
   patch_clustername_env "$CTX_WEST" "$CTX_WEST"

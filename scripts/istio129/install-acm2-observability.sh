@@ -28,6 +28,13 @@ PROM_BACKEND_SVC_SCHEME="${PROM_BACKEND_SVC_SCHEME:-https}"
 
 PROMXY_IMAGE="${PROMXY_IMAGE:-quay.io/jacksontj/promxy:v0.0.93}"
 
+TRACING_ENABLED="${TRACING_ENABLED:-true}"
+TRACING_USE_WAYPOINT_NAME="${TRACING_USE_WAYPOINT_NAME:-true}"
+TEMPO_NS="${TEMPO_NS:-${ISTIO_NS}}"
+TEMPO_SVC_NAME="${TEMPO_SVC_NAME:-tempo}"
+TEMPO_QUERY_PORT="${TEMPO_QUERY_PORT:-3200}"
+TEMPO_INTERNAL_URL="${TEMPO_INTERNAL_URL:-http://${TEMPO_SVC_NAME}.${TEMPO_NS}.svc.cluster.local:${TEMPO_QUERY_PORT}/}"
+
 log "=== Hub observability on ${CTX_ACM} (Kiali multi-cluster + promxy) ==="
 log "Hub: ${CTX_ACM}"
 log "Remote clusters: ${CTX_EAST}, ${CTX_WEST}"
@@ -56,6 +63,14 @@ resolve_host_ip() {
 ctx_cluster_server() {
   local ctx="$1"
   kubectl --context "$ctx" config view --raw --minify -o jsonpath='{.clusters[0].cluster.server}'
+}
+
+server_url_to_hostport() {
+  local url="$1"
+  url="${url#https://}"
+  url="${url#http://}"
+  url="${url%/}"
+  printf '%s' "$url"
 }
 
 ctx_cluster_ca_data() {
@@ -198,21 +213,18 @@ deploy_promxy_on_hub() {
   log "Deploying promxy on ${CTX_ACM}..."
   ensure_ns "$CTX_ACM" "$ISTIO_NS"
 
-  local east_target west_target
+  local east_target west_target path_prefix
+  path_prefix=""
   if [[ "$PROM_BACKEND_NS" == "istio-system" && "$PROM_BACKEND_SVC" == "prometheus" ]]; then
-    # Prefer Prometheus Service LoadBalancer IPs to avoid DNS flakiness and TLS/SNI issues with Routes.
-    # Prometheus addon listens on :9090 (http).
-    local east_lb west_lb east_ip west_ip
-    east_lb="$(kubectl --context "$CTX_EAST" -n "$PROM_BACKEND_NS" get svc "$PROM_BACKEND_SVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
-    west_lb="$(kubectl --context "$CTX_WEST" -n "$PROM_BACKEND_NS" get svc "$PROM_BACKEND_SVC" -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
-    [[ -n "${east_lb:-}" ]] || die "Could not resolve east Prometheus LoadBalancer address (svc ${PROM_BACKEND_NS}/${PROM_BACKEND_SVC})"
-    [[ -n "${west_lb:-}" ]] || die "Could not resolve west Prometheus LoadBalancer address (svc ${PROM_BACKEND_NS}/${PROM_BACKEND_SVC})"
-
-    east_ip="$(resolve_host_ip "$east_lb" || true)"; east_ip="${east_ip:-$east_lb}"
-    west_ip="$(resolve_host_ip "$west_lb" || true)"; west_ip="${west_ip:-$west_lb}"
-    east_target="${east_ip}:9090"
-    west_target="${west_ip}:9090"
-    PROM_BACKEND_SVC_SCHEME="http"
+    # Prefer querying remote Prometheus via the remote Kubernetes API server proxy:
+    # avoids relying on Routes/LBs being reachable from the hub cluster.
+    local east_server west_server
+    east_server="$(ctx_cluster_server "$CTX_EAST")"
+    west_server="$(ctx_cluster_server "$CTX_WEST")"
+    east_target="$(server_url_to_hostport "$east_server")"
+    west_target="$(server_url_to_hostport "$west_server")"
+    PROM_BACKEND_SVC_SCHEME="https"
+    path_prefix="/api/v1/namespaces/${PROM_BACKEND_NS}/services/${PROM_BACKEND_SVC}:9090/proxy"
   else
     # Default: use each cluster's backend Route (Thanos, etc).
     east_target="$(oc --context "$CTX_EAST" -n "$PROM_BACKEND_NS" get route "$PROM_BACKEND_SVC" -o jsonpath='{.spec.host}'):443"
@@ -236,6 +248,7 @@ stringData:
   EAST_TOKEN: ${east_token}
   WEST_TOKEN: ${west_token}
   BACKEND_SCHEME: ${PROM_BACKEND_SVC_SCHEME}
+  PATH_PREFIX: ${path_prefix}
 EOF
 
   kubectl --context "$CTX_ACM" -n "$ISTIO_NS" apply -f - >/dev/null <<'EOF'
@@ -258,6 +271,7 @@ data:
         anti_affinity: 30s
         ignore_error: true
         scheme: __BACKEND_SCHEME__
+        path_prefix: "__PATH_PREFIX__"
         http_client:
           bearer_token: "__EAST_TOKEN__"
           tls_config:
@@ -269,6 +283,7 @@ data:
         anti_affinity: 30s
         ignore_error: true
         scheme: __BACKEND_SCHEME__
+        path_prefix: "__PATH_PREFIX__"
         http_client:
           bearer_token: "__WEST_TOKEN__"
           tls_config:
@@ -315,12 +330,14 @@ spec:
               EAST_TOKEN="\$(cat /upstreams/EAST_TOKEN)"
               WEST_TOKEN="\$(cat /upstreams/WEST_TOKEN)"
               BACKEND_SCHEME="\$(cat /upstreams/BACKEND_SCHEME 2>/dev/null || echo https)"
+              PATH_PREFIX="\$(cat /upstreams/PATH_PREFIX 2>/dev/null || echo '')"
               sed \
                 -e "s|__EAST_TARGET__|\${EAST_TARGET}|g" \
                 -e "s|__WEST_TARGET__|\${WEST_TARGET}|g" \
                 -e "s|__EAST_TOKEN__|\${EAST_TOKEN}|g" \
                 -e "s|__WEST_TOKEN__|\${WEST_TOKEN}|g" \
                 -e "s|__BACKEND_SCHEME__|\${BACKEND_SCHEME}|g" \
+                -e "s|__PATH_PREFIX__|\${PATH_PREFIX}|g" \
                 "\$TPL" > "\$OUT"
           volumeMounts:
             - name: cfg-tpl
@@ -421,7 +438,13 @@ spec:
       auth:
         type: none
     tracing:
-      enabled: false
+      enabled: ${TRACING_ENABLED}
+      provider: tempo
+      internal_url: "${TEMPO_INTERNAL_URL}"
+      use_grpc: false
+      use_waypoint_name: ${TRACING_USE_WAYPOINT_NAME}
+      auth:
+        type: none
     grafana:
       enabled: false
   kubernetes_config:

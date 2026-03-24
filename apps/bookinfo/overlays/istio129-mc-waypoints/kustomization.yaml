@@ -1,0 +1,62 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../istio129-mc
+
+patches:
+  # Enable per-service waypoint enrollment (L7) for demos/use cases.
+  - target: { kind: Service, name: productpage }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: productpage
+        labels:
+          istio.io/use-waypoint: productpage-waypoint
+          istio.io/use-waypoint-namespace: bookinfo
+
+  - target: { kind: Service, name: reviews }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: reviews
+        labels:
+          istio.io/use-waypoint: reviews-waypoint
+          istio.io/use-waypoint-namespace: bookinfo
+
+  - target: { kind: Service, name: ratings }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ratings
+        labels:
+          istio.io/use-waypoint: ratings-waypoint
+          istio.io/use-waypoint-namespace: bookinfo
+
+  - target: { kind: Service, name: details }
+    patch: |-
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: details
+        labels:
+          istio.io/use-waypoint: details-waypoint
+          istio.io/use-waypoint-namespace: bookinfo
+
+  # Some OpenShift interception/DNAT paths require workload labeling as well.
+  - target: { kind: Deployment, name: productpage-v1 }
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: productpage-v1
+      spec:
+        template:
+          metadata:
+            labels:
+              istio.io/use-waypoint: productpage-waypoint
+              istio.io/use-waypoint-namespace: bookinfo
+

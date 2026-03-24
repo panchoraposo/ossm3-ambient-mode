@@ -16,6 +16,9 @@ PRE_HOLD_SECONDS="${PRE_HOLD_SECONDS:-45}"
 POST_HOLD_SECONDS="${POST_HOLD_SECONDS:-90}"
 LOAD_SLEEP_SECONDS="${LOAD_SLEEP_SECONDS:-0.05}"
 PROGRESS_EVERY_SECONDS="${PROGRESS_EVERY_SECONDS:-20}"
+AUTO_ENABLE_WAYPOINTS="${AUTO_ENABLE_WAYPOINTS:-true}"
+DEMO_CLEANUP="${DEMO_CLEANUP:-true}"
+_AUTO_ENABLED_WAYPOINTS="false"
 
 ensure_curl_pod() {
   if kubectl --context "$CTX_EAST" get pod -n "$NS" "$CURL_POD" >/dev/null 2>&1; then
@@ -207,6 +210,19 @@ main() {
     log "  - If still empty: enable 'Idle nodes/edges' display and clear any 'Hide' filters."
   fi
   log ""
+
+  if ! bookinfo_waypoints_configured "$CTX_EAST" "$NS" || ! bookinfo_waypoints_configured "$CTX_WEST" "$NS"; then
+    if [[ "${AUTO_ENABLE_WAYPOINTS}" == "true" ]]; then
+      enable_bookinfo_waypoints "$CTX_EAST" "$NS"
+      enable_bookinfo_waypoints "$CTX_WEST" "$NS"
+      _AUTO_ENABLED_WAYPOINTS="true"
+      if [[ "${DEMO_CLEANUP}" == "true" ]]; then
+        trap 'if [[ "${_AUTO_ENABLED_WAYPOINTS}" == "true" ]]; then disable_bookinfo_waypoints "$CTX_EAST" "$NS"; disable_bookinfo_waypoints "$CTX_WEST" "$NS"; fi' EXIT
+      fi
+    else
+      die "Waypoints are not configured in one or both clusters. Set AUTO_ENABLE_WAYPOINTS=true or enable them manually."
+    fi
+  fi
 
   ensure_curl_pod
   cleanup_traffic_shift

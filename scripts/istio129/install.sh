@@ -8,6 +8,7 @@ source "${SCRIPT_DIR}/common.sh"
 need kubectl
 need oc
 need openssl
+need curl
 
 require_context "$CTX_EAST"
 require_context "$CTX_WEST"
@@ -167,8 +168,22 @@ spec:
   profile: ambient
   hub: docker.io/istio
   tag: ${ISTIO_VERSION}
+  components:
+    pilot:
+      k8s:
+        env:
+          - name: AMBIENT_ENABLE_MULTI_NETWORK
+            value: "true"
+          - name: AMBIENT_ENABLE_BAGGAGE
+            value: "true"
   meshConfig:
     accessLogFile: /dev/stdout
+    enableTracing: true
+    defaultConfig:
+      tracing:
+        sampling: 100.0
+        zipkin:
+          address: otel-collector.${ISTIO_NS}.svc.cluster.local:9411
   values:
     cni:
       # OpenShift uses /var/lib/cni/bin for CNI binaries (not /opt/cni/bin)
@@ -192,79 +207,38 @@ create_remote_secrets() {
     | kubectl --context "$CTX_EAST" apply -n "$ISTIO_NS" -f - >/dev/null
 }
 
-create_eastwest_gateway_and_route() {
-  local ctx="$1"
-  log "Creating east-west HBONE gateway (Service type LoadBalancer) on ${ctx}..."
-  # Gateway (HBONE, mTLS terminate) for cross-network/cluster traffic.
-  # NOTE: For ambient multi-network, Istio needs a real externally reachable address.
-  kubectl --context "$ctx" apply -n "$ISTIO_NS" -f - >/dev/null <<'EOF'
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: istio-eastwestgateway
-  annotations:
-    networking.istio.io/service-type: LoadBalancer
-spec:
-  gatewayClassName: istio-east-west
-  listeners:
-    - name: mesh
-      port: 15008
-      protocol: HBONE
-      tls:
-        mode: Terminate
-        options:
-          gateway.istio.io/tls-terminate-mode: ISTIO_MUTUAL
-EOF
+ensure_istio_system_network_label() {
+  local ctx="$1" network="$2"
+  kubectl --context "$ctx" label namespace "$ISTIO_NS" "topology.istio.io/network=${network}" --overwrite >/dev/null 2>&1 || true
 }
 
-gateway_lb_addr() {
-  local ctx="$1"
-  local ip host
-  ip="$(kubectl --context "$ctx" -n "$ISTIO_NS" get svc istio-eastwestgateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
-  host="$(kubectl --context "$ctx" -n "$ISTIO_NS" get svc istio-eastwestgateway -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
-  [[ -n "${ip:-}" ]] && { echo "$ip"; return 0; }
-  [[ -n "${host:-}" ]] && { echo "$host"; return 0; }
-  return 1
-}
+install_ambient_eastwest_gateway() {
+  local ctx="$1" network="$2"
+  log "Installing ambient east-west gateway on ${ctx} (network=${network})..."
 
-reinstall_with_meshnetworks() {
-  local ctx="$1" cluster_name="$2" network="$3" east_addr="$4" west_addr="$5"
-  log "Re-installing Istio with meshNetworks on ${ctx}..."
-  local op_yaml
-  op_yaml="$(cat <<EOF
-apiVersion: install.istio.io/v1alpha1
-kind: IstioOperator
-spec:
-  profile: ambient
-  hub: docker.io/istio
-  tag: ${ISTIO_VERSION}
-  meshConfig:
-    accessLogFile: /dev/stdout
-  values:
-    cni:
-      cniBinDir: /var/lib/cni/bin
-      cniConfDir: /etc/cni/net.d
-    global:
-      meshID: ${MESH_ID}
-      multiCluster:
-        clusterName: ${cluster_name}
-      network: ${network}
-      meshNetworks:
-        network1:
-          endpoints:
-            - fromRegistry: ${CTX_EAST}
-          gateways:
-            - address: ${east_addr}
-              port: 15008
-        network2:
-          endpoints:
-            - fromRegistry: ${CTX_WEST}
-          gateways:
-            - address: ${west_addr}
-              port: 15008
-EOF
-)"
-  istioctl_install_with_openshift_patches "$ctx" "$op_yaml"
+  local minor url script_path
+  minor="$(echo "$ISTIO_VERSION" | awk -F. '{print $1 "." $2}')"
+  url="https://raw.githubusercontent.com/istio/istio/release-${minor}/samples/multicluster/gen-eastwest-gateway.sh"
+  script_path="${ISTIO_CACHE_DIR}/${ISTIO_VERSION}/gen-eastwest-gateway.sh"
+
+  mkdir -p "$(dirname "$script_path")"
+  if [[ ! -s "$script_path" ]]; then
+    curl -fsSL "$url" -o "$script_path"
+    chmod +x "$script_path"
+  fi
+
+  # Clean up any previous eastwest gateway variants (Gateway API based, or earlier attempts).
+  kubectl --context "$ctx" -n "$ISTIO_NS" delete gateway.gateway.networking.k8s.io istio-eastwestgateway --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$ctx" -n "$ISTIO_NS" delete deploy istio-eastwestgateway istio-eastwestgateway-istio --ignore-not-found >/dev/null 2>&1 || true
+  kubectl --context "$ctx" -n "$ISTIO_NS" delete svc istio-eastwestgateway istio-eastwestgateway-istio --ignore-not-found >/dev/null 2>&1 || true
+
+  # Apply generated manifest (creates svc/deploy/sa/roles).
+  "$script_path" --network "$network" --ambient | kubectl --context "$ctx" apply -n "$ISTIO_NS" -f - >/dev/null
+
+  # OpenShift SCC: eastwest gateway runs with fixed UID.
+  oc --context "$ctx" adm policy add-scc-to-user anyuid -n "$ISTIO_NS" -z istio-eastwestgateway-service-account >/dev/null 2>&1 || true
+
+  kubectl --context "$ctx" -n "$ISTIO_NS" rollout status deploy/istio-eastwestgateway --timeout=300s >/dev/null
 }
 
 main() {
@@ -279,44 +253,21 @@ main() {
   apply_cacerts_secret "$CTX_EAST"
   apply_cacerts_secret "$CTX_WEST"
 
+  ensure_istio_system_network_label "$CTX_EAST" "network1"
+  ensure_istio_system_network_label "$CTX_WEST" "network2"
+
   install_istio_base "$CTX_EAST" "$CTX_EAST" "network1"
   install_istio_base "$CTX_WEST" "$CTX_WEST" "network2"
 
   create_remote_secrets
 
-  create_eastwest_gateway_and_route "$CTX_EAST"
-  create_eastwest_gateway_and_route "$CTX_WEST"
+  install_ambient_eastwest_gateway "$CTX_EAST" "network1"
+  install_ambient_eastwest_gateway "$CTX_WEST" "network2"
 
-  log "Waiting for east-west gateway LoadBalancer addresses..."
-  local east_host west_host
-  for _ in {1..180}; do
-    east_host="$(gateway_lb_addr "$CTX_EAST" 2>/dev/null || true)"
-    west_host="$(gateway_lb_addr "$CTX_WEST" 2>/dev/null || true)"
-    [[ -n "$east_host" && -n "$west_host" ]] && break
-    sleep 2
-  done
-  [[ -n "${east_host:-}" ]] || die "Could not resolve east east-west gateway LB address"
-  [[ -n "${west_host:-}" ]] || die "Could not resolve west east-west gateway LB address"
-  log "east-west gateway addresses:"
-  log "  east: ${east_host}"
-  log "  west: ${west_host}"
-
-  local east_addr west_addr
-  east_addr="$(resolve_host_ip "$east_host" || true)"
-  west_addr="$(resolve_host_ip "$west_host" || true)"
-  if [[ -n "${east_addr:-}" && -n "${west_addr:-}" ]]; then
-    log "east-west gateway resolved IPs:"
-    log "  east: ${east_addr}"
-    log "  west: ${west_addr}"
-  else
-    log "WARNING: could not resolve gateway hostnames to IPs; using hostnames in meshNetworks."
-    east_addr="$east_host"
-    west_addr="$west_host"
-  fi
-
-  reinstall_with_meshnetworks "$CTX_EAST" "$CTX_EAST" "network1" "$east_addr" "$west_addr"
-  reinstall_with_meshnetworks "$CTX_WEST" "$CTX_WEST" "network2" "$east_addr" "$west_addr"
-
+  log ""
+  log "East-west gateway services:"
+  log "  east: $(kubectl --context "$CTX_EAST" -n "$ISTIO_NS" get svc istio-eastwestgateway -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')"
+  log "  west: $(kubectl --context "$CTX_WEST" -n "$ISTIO_NS" get svc istio-eastwestgateway -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')"
   log ""
   log "Next: deploy Bookinfo + waypoints:"
   log "  CTX_EAST=${CTX_EAST} CTX_WEST=${CTX_WEST} ./scripts/istio129/deploy-bookinfo.sh"
