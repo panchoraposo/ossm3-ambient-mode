@@ -19,6 +19,9 @@ WARN="${YELLOW}⚠${RESET}"
 CTX="${1:-east}"
 
 RUN_HINT="${RUN_HINT:-./ossm/uc9-verify.sh}"
+ACM_CTX="${ACM_CTX:-acm}" # where centralized Kiali/Tempo live (if installed)
+KIALI_CTX="${KIALI_CTX:-${ACM_CTX}}"
+KIALI_NS="${KIALI_NS:-istio-system}"
 
 CLIENT_NS="${CLIENT_NS:-bookinfo}"
 CLIENT_LABEL="${CLIENT_LABEL:-app=productpage}"
@@ -28,6 +31,9 @@ KEEP_RESOURCES_ON_FAIL="${KEEP_RESOURCES_ON_FAIL:-false}"
 KEEP_RESOURCES="${KEEP_RESOURCES:-false}" # keep resources even on success (demo/Kiali)
 NO_PAUSE="${NO_PAUSE:-false}"
 CLIENT_MODE="${CLIENT_MODE:-auto}" # auto|force-client-pod
+WAIT_CLEANUP="${WAIT_CLEANUP:-true}"      # wait for namespaces to be fully deleted (safer for sequential runs)
+CLEANUP_TIMEOUT_SEC="${CLEANUP_TIMEOUT_SEC:-300}"
+WAIT_POLL_SEC="${WAIT_POLL_SEC:-2}"
 
 HOST_FRONT="customcert.bank.demo"
 CUSTOM_CA_HEADER="${CUSTOM_CA_HEADER:-x-bank-custom-ca}"
@@ -42,7 +48,20 @@ WAYPOINT_NAME="custom-cert-egress"
 
 KIALI_DEMO="${KIALI_DEMO:-false}"        # deploy background traffic generator + keep resources
 TRAFFIC_PERIOD_SEC="${TRAFFIC_PERIOD_SEC:-2}"
-TRAFFIC_NS="${TRAFFIC_NS:-${CLIENT_NS}}" # where to deploy background traffic (prefer bookinfo)
+# Where to deploy background traffic. If unset, we set it after selecting the client namespace.
+TRAFFIC_NS="${TRAFFIC_NS:-}"
+
+# Demo enhancements (graph + traces)
+ENABLE_CLIENT_WAYPOINT="${ENABLE_CLIENT_WAYPOINT:-auto}" # auto|true|false ; auto enables when KIALI_DEMO=true
+CLIENT_WAYPOINT_NAME="${CLIENT_WAYPOINT_NAME:-uc9-client}"
+CLIENT_WAYPOINT_CREATED="false"
+
+# Kiali tracing fetch fix for console proxy timeouts.
+# In some environments Kiali multi-cluster trace searches add tags (istio.cluster_id) which can make Tempo searches slow,
+# causing the OpenShift console proxy to return 504.
+# If enabled, this patch disables Kiali multi-cluster autodetection so trace searches are faster.
+KIALI_TRACES_PATCH="${KIALI_TRACES_PATCH:-false}" # true|false
+KIALI_TRACES_BACKUP_CM="${KIALI_TRACES_BACKUP_CM:-uc9-kiali-config-backup}"
 
 BUILD_MODE="${BUILD_MODE:-binary}" # binary|git|prebuilt
 GIT_REPO_URL="${GIT_REPO_URL:-}"
@@ -68,6 +87,19 @@ pause() {
   read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
 }
 
+wait_ns_deleted() {
+  local ns="$1"
+  local deadline=$(( $(date +%s) + CLEANUP_TIMEOUT_SEC ))
+  while oc --context "$CTX" get ns "$ns" >/dev/null 2>&1; do
+    if [[ $(date +%s) -ge $deadline ]]; then
+      echo -e "  ${WARN} Namespace ${BOLD}${ns}${RESET} still exists (Terminating?) after ${CLEANUP_TIMEOUT_SEC}s"
+      return 0
+    fi
+    sleep "${WAIT_POLL_SEC}"
+  done
+  return 0
+}
+
 header() {
   echo ""
   echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -80,12 +112,110 @@ section() {
   echo -e "${BOLD}▸ $1${RESET}"
 }
 
+ns_is_ambient() {
+  local ns="$1"
+  local mode
+  mode="$(oc --context "$CTX" get ns "$ns" -o jsonpath='{.metadata.labels.istio\.io/dataplane-mode}' 2>/dev/null || true)"
+  [[ "${mode}" == "ambient" ]]
+}
+
+ensure_client_waypoint_for_demo() {
+  # Create a waypoint in the *client* namespace for L7 visibility/traces.
+  # Only ever applied to the dedicated demo namespace (never to bookinfo).
+  local ns="${CLIENT_NS}"
+
+  local enabled="${ENABLE_CLIENT_WAYPOINT}"
+  if [[ "${enabled}" == "auto" ]]; then
+    if [[ "${KIALI_DEMO}" == "true" ]]; then
+      enabled="true"
+    else
+      enabled="false"
+    fi
+  fi
+  if [[ "${enabled}" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ "${DEDICATED_CLIENT_NS_CREATED}" != "true" ]]; then
+    return 0
+  fi
+
+  section "Demo: create client waypoint (${ns}/${CLIENT_WAYPOINT_NAME}) for L7 graph + traces"
+  istioctl --context "$CTX" waypoint apply --enroll-namespace --name "${CLIENT_WAYPOINT_NAME}" --namespace "${ns}" >/dev/null 2>&1 || true
+  if oc --context "$CTX" wait --for=condition=Ready pod -n "${ns}" -l gateway.networking.k8s.io/gateway-name="${CLIENT_WAYPOINT_NAME}" --timeout=180s >/dev/null 2>&1; then
+    CLIENT_WAYPOINT_CREATED="true"
+    echo -e "  ${PASS} Client waypoint pod is Ready"
+  else
+    echo -e "  ${WARN} Client waypoint did not become Ready in time (traces may be limited)"
+  fi
+}
+
 need_cmd() {
   local c="$1"
   if ! command -v "$c" >/dev/null 2>&1; then
     echo -e "  ${FAIL} Missing command: ${BOLD}${c}${RESET}"
     exit 1
   fi
+}
+
+kiali_patch_traces_if_needed() {
+  if [[ "${KIALI_TRACES_PATCH}" != "true" ]]; then
+    return 0
+  fi
+
+  section "Demo: patch Kiali config to speed up trace searches"
+  echo -e "  Target: context=${BOLD}${KIALI_CTX}${RESET} namespace=${BOLD}${KIALI_NS}${RESET} configmap=${BOLD}kiali${RESET}"
+
+  # Backup current config.yaml into a separate ConfigMap (so we can restore later).
+  cfg="$(oc --context "${KIALI_CTX}" -n "${KIALI_NS}" get cm kiali -o jsonpath='{.data.config\\.yaml}' 2>/dev/null || true)"
+  if [[ -z "${cfg}" ]]; then
+    echo -e "  ${WARN} Could not read Kiali config.yaml; skipping patch."
+    return 0
+  fi
+
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${KIALI_TRACES_BACKUP_CM}
+  namespace: ${KIALI_NS}
+  labels:
+    app: uc9-demo
+data:
+  config.yaml: |
+$(printf '%s\n' "${cfg}" | sed 's/^/    /')
+EOF
+
+  # Patch: disable multi-cluster autodetection to avoid adding istio.cluster_id tag filters in trace searches.
+  patched="$(printf '%s\n' "${cfg}" | python3 - <<'PY'
+import sys,re
+s=sys.stdin.read()
+# Replace only the specific 'clustering.autodetect_secrets.enabled: true' if present.
+s=re.sub(r'(^clustering:\\n(?:[ ]{2}.*\\n)*?[ ]{2}autodetect_secrets:\\n(?:[ ]{4}.*\\n)*?[ ]{4}enabled:)[ ]*true\\b',
+         r'\\1 false', s, flags=re.M)
+print(s)
+PY
+)"
+
+  if [[ "${patched}" == "${cfg}" ]]; then
+    echo -e "  ${WARN} Kiali config did not match expected pattern; no changes applied."
+    echo -e "       You can restore with: bash ossm/uc9/uc9-kiali-traces-restore.sh"
+    return 0
+  fi
+
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" patch cm kiali --type merge \
+    -p "$(python3 - <<PY
+import json,sys
+data={"data":{"config.yaml":"""${patched}""" }}
+print(json.dumps(data))
+PY
+)" >/dev/null
+
+  echo -e "  ${PASS} Patched Kiali configmap; restarting Kiali"
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" rollout restart deploy/kiali >/dev/null 2>&1 || true
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" rollout status deploy/kiali --timeout=180s >/dev/null 2>&1 || true
+  echo -e "  ${PASS} Kiali restarted"
+  echo -e "  ${CYAN}Restore later:${RESET} bash ossm/uc9/uc9-kiali-traces-restore.sh"
 }
 
 TMPDIR=""
@@ -111,9 +241,21 @@ cleanup() {
   oc --context "$CTX" --request-timeout=10s delete namespace "$BACKEND_NS" --wait=false 2>/dev/null || true
   oc --context "$CTX" delete deploy uc9-traffic -n "$TRAFFIC_NS" 2>/dev/null || true
   if [[ "${DEDICATED_CLIENT_NS_CREATED}" == "true" ]]; then
+    if [[ "${CLIENT_WAYPOINT_CREATED}" == "true" ]]; then
+      istioctl --context "$CTX" waypoint delete --namespace "$CLIENT_NS_FALLBACK" "$CLIENT_WAYPOINT_NAME" >/dev/null 2>&1 || true
+    fi
     oc --context "$CTX" --request-timeout=10s delete namespace "$CLIENT_NS_FALLBACK" --wait=false 2>/dev/null || true
   else
     oc --context "$CTX" delete pod custom-cert-client -n "$CLIENT_NS" 2>/dev/null || true
+  fi
+
+  if [[ "${WAIT_CLEANUP}" == "true" ]]; then
+    echo -e "  ${CYAN}Waiting for namespaces to be deleted (sequential-run safety)...${RESET}"
+    wait_ns_deleted "$EGRESS_NS"
+    wait_ns_deleted "$BACKEND_NS"
+    if [[ "${DEDICATED_CLIENT_NS_CREATED}" == "true" ]]; then
+      wait_ns_deleted "$CLIENT_NS_FALLBACK"
+    fi
   fi
 }
 
@@ -127,6 +269,21 @@ need_cmd tr
 
 header "UC9: Special Case of Custom Certificate — custom CA trust only for one destination"
 echo -e "  Context: ${BOLD}${CTX}${RESET}"
+
+section "Tracing prerequisites (for Kiali Traces)"
+tracing_enabled="$(oc --context "$CTX" -n istio-system get istio default -o jsonpath='{.spec.values.meshConfig.enableTracing}' 2>/dev/null || true)"
+tracing_sampling="$(oc --context "$CTX" -n istio-system get istio default -o jsonpath='{.spec.values.meshConfig.defaultConfig.tracing.sampling}' 2>/dev/null || true)"
+if [[ "$tracing_enabled" == "true" ]]; then
+  echo -e "  ${PASS} Istio tracing enabled (sampling=${BOLD}${tracing_sampling:-?}${RESET})"
+else
+  echo -e "  ${WARN} Istio tracing not detected in Istio CR (spec.values.meshConfig.enableTracing). Traces may not appear in Kiali."
+fi
+tempo_jaeger_host="$(oc --context "${ACM_CTX}" -n istio-system get route tempo-jaeger-query -o jsonpath='{.spec.host}' 2>/dev/null || true)"
+if [[ -n "${tempo_jaeger_host}" ]]; then
+  echo -e "  ${PASS} Tempo (Jaeger Query API) route: ${BOLD}https://${tempo_jaeger_host}${RESET}"
+else
+  echo -e "  ${WARN} Tempo route not found on context ${BOLD}${ACM_CTX}${RESET} (route tempo-jaeger-query)."
+fi
 
 deploy_kiali_traffic_uc9() {
   local ns="${TRAFFIC_NS}"
@@ -321,9 +478,22 @@ build_image() {
 
 section "1. Verify prerequisites (client + DNS capture)"
 PRODUCTPAGE_POD=""
+orig_client_ns="${CLIENT_NS}"
 
 if [[ "${CLIENT_MODE}" != "force-client-pod" ]]; then
   PRODUCTPAGE_POD=$(oc --context "$CTX" get pods -n "$CLIENT_NS" -l "$CLIENT_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+fi
+
+if [[ "${KIALI_DEMO}" == "true" && "${CLIENT_NS}" == "bookinfo" ]]; then
+  # In demo mode we must NOT depend on bookinfo being ambient-enrolled (often it's not).
+  PRODUCTPAGE_POD=""
+fi
+
+if [[ -n "${PRODUCTPAGE_POD}" ]] && ! ns_is_ambient "${CLIENT_NS}"; then
+  # DNS capture for ServiceEntry VIPs requires the client to be in ambient dataplane-mode.
+  echo -e "  ${WARN} Found client pod in ${BOLD}${CLIENT_NS}${RESET}, but namespace is not labeled ${BOLD}istio.io/dataplane-mode=ambient${RESET}."
+  echo -e "       Using dedicated ambient client namespace ${BOLD}${CLIENT_NS_FALLBACK}${RESET} (no changes to ${BOLD}${orig_client_ns}${RESET})."
+  PRODUCTPAGE_POD=""
 fi
 
 if [[ -z "${PRODUCTPAGE_POD}" ]]; then
@@ -364,6 +534,15 @@ EOF
 else
   echo -e "  ${PASS} Client pod: ${BOLD}${CLIENT_NS}/${PRODUCTPAGE_POD}${RESET}"
 fi
+
+# Default traffic namespace to selected client namespace (safe for cleanup; never suggests deleting bookinfo).
+: "${TRAFFIC_NS:=${CLIENT_NS}}"
+
+# Optional: patch Kiali config to avoid trace-search 504s via console proxy.
+kiali_patch_traces_if_needed
+
+# For demo, create a client waypoint so Kiali can show L7 edges + traces reliably.
+ensure_client_waypoint_for_demo
 
 dns_capture=$(oc --context "$CTX" get istiocni default -o jsonpath='{.spec.values.cni.ambient.dnsCapture}' 2>/dev/null || true)
 if [[ "$dns_capture" != "true" ]]; then
@@ -851,10 +1030,26 @@ hdr="$(run_client_http "true")"
 echo -e "  No header:   ${BOLD}${nohdr}${RESET}"
 echo -e "  With header: ${BOLD}${hdr}${RESET}"
 
+extract_http_code() {
+  local s="$1"
+  if echo "$s" | grep -qE '^OK\\|[0-9]{3}\\|'; then
+    echo "$s" | awk -F'|' '{print $2}'
+    return 0
+  fi
+  if echo "$s" | grep -qE '^HTTPERROR\\|[0-9]{3}\\|'; then
+    echo "$s" | awk -F'|' '{print $2}'
+    return 0
+  fi
+  echo "ERROR"
+}
+
+nohdr_code="$(extract_http_code "$nohdr")"
+hdr_code="$(extract_http_code "$hdr")"
+
 ok_nohdr="fail"
 ok_hdr="fail"
-if ! echo "$nohdr" | grep -q '^OK|200'; then ok_nohdr="pass"; fi
-if echo "$hdr" | grep -q '^OK|200'; then ok_hdr="pass"; fi
+if [[ "${nohdr_code}" != "200" ]]; then ok_nohdr="pass"; fi
+if [[ "${hdr_code}" == "200" ]]; then ok_hdr="pass"; fi
 
 pause "Press ENTER to cleanup..."
 
@@ -864,8 +1059,26 @@ if [[ "${KIALI_DEMO}" == "true" ]]; then
   deploy_kiali_traffic_uc9
   echo ""
   echo -e "  ${WARN} Resources are being kept for demo (KIALI_DEMO=true)."
-  echo -e "  To cleanup later, delete namespaces:"
+  echo -e "  To cleanup later, delete ONLY the demo namespaces (safe):"
   echo -e "    oc --context ${CTX} delete ns ${CLIENT_NS} ${EGRESS_NS} ${BACKEND_NS} --wait=false"
+  echo -e "  Or run the cleanup helper:"
+  echo -e "    bash ossm/uc9/uc9-demo-cleanup.sh ${CTX}"
+  echo ""
+  echo -e "  ${CYAN}Kiali graph namespaces:${RESET}"
+  echo -e "    - ${BOLD}${CLIENT_NS}${RESET} (client)"
+  echo -e "    - ${BOLD}${EGRESS_NS}${RESET} (waypoint + connectors)"
+  echo -e "    - ${BOLD}${BACKEND_NS}${RESET} (backend)"
+  echo ""
+  echo -e "  ${CYAN}Traces tip:${RESET}"
+  echo -e "    - Traces are emitted by the ${BOLD}waypoints (Envoy)${RESET}, not by the HAProxy connector pods."
+  echo -e "    - In the Kiali graph, click the triangle waypoint nodes:"
+  echo -e "      - ${BOLD}${EGRESS_NS}/${WAYPOINT_NAME}${RESET} (egress waypoint)"
+  echo -e "      - ${BOLD}${CLIENT_NS}/${CLIENT_WAYPOINT_NAME}${RESET} (client waypoint)"
+  echo -e "    - Then open the ${BOLD}Traces${RESET} tab and click ${BOLD}Show Traces${RESET} (Last 5m)."
+  echo -e "    - You should see requests for host ${BOLD}${HOST_FRONT}${RESET}."
+  echo -e "    - If you still see ${BOLD}504${RESET} errors in the UI, re-run with:"
+  echo -e "      ${BOLD}KIALI_TRACES_PATCH=true${RESET} (and later restore using uc9-kiali-traces-restore.sh)."
+  echo -e "  ${CYAN}Note:${RESET} this script does not modify or require deleting ${BOLD}bookinfo${RESET}."
   exit 0
 fi
 
@@ -874,12 +1087,12 @@ cleanup
 
 header "Results"
 echo ""
-echo -e "  | Check                                 | Expected | Result |"
-echo -e "  |---------------------------------------|----------|--------|"
-printf   "  | Default path (no header)              | FAIL     | %b |\n" \
-  "$([ "$ok_nohdr" = "pass" ] && echo -e "${PASS}" || echo -e "${FAIL}")"
-printf   "  | Custom-CA path (header ${CUSTOM_CA_HEADER}=true) | 200 OK   | %b |\n" \
-  "$([ "$ok_hdr" = "pass" ] && echo -e "${PASS}" || echo -e "${FAIL}")"
+echo -e "  | Check                                 | Expected | Got  | Meaning (for Kiali/Traces) |"
+echo -e "  |---------------------------------------|----------|------|----------------------------|"
+printf   "  | Default path (no header)              | FAIL     | %s  | strict connector: no custom CA trust → TLS failure / upstream unavailable |\n" \
+  "$nohdr_code"
+printf   "  | Custom-CA path (header ${CUSTOM_CA_HEADER}=true) | 200 OK   | %s  | custom-ca connector: custom CA trust injected → success |\n" \
+  "$hdr_code"
 echo ""
 
 if [[ "$ok_nohdr" = "pass" && "$ok_hdr" = "pass" ]]; then
@@ -888,5 +1101,12 @@ else
   echo -e "  ${FAIL} ${RED}${BOLD}UC9 FAILED${RESET} — unexpected HTTP results"
   exit 1
 fi
+echo ""
+
+header "HTTP codes you should expect"
+echo ""
+echo -e "  - ${BOLD}200${RESET}: custom CA path works (header set)"
+echo -e "  - ${BOLD}503/504/ERROR${RESET}: strict path fails (header missing) — typically TLS handshake or timeout through egress"
+echo -e "  - ${BOLD}If you see 000/timeout in clients${RESET}: it usually means DNS capture/ServiceEntry/waypoint path is not ready yet"
 echo ""
 

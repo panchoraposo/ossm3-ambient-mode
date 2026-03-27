@@ -23,16 +23,36 @@ UC_TITLE="${UC_TITLE:-Special Ciphers}"
 UC_VARIANT="${UC_VARIANT:-Connectivity Link (Kuadrant)}"
 UC_DIR="${UC_DIR:-ossm/uc11}"
 RUN_HINT="${RUN_HINT:-./${0##*/}}"
+ACM_CTX="${ACM_CTX:-acm}" # where centralized Kiali/Tempo live (if installed)
 
 CLIENT_NS="${CLIENT_NS:-bookinfo}"
 CLIENT_LABEL="${CLIENT_LABEL:-app=productpage}"
+CLIENT_NS_FALLBACK="${CLIENT_NS_FALLBACK:-uc11-kuadrant-client}"
 NO_PAUSE="${NO_PAUSE:-false}"
 AUTO_ENABLE_DNS_CAPTURE="${AUTO_ENABLE_DNS_CAPTURE:-false}"
 KEEP_RESOURCES="${KEEP_RESOURCES:-false}" # keep resources even on success (demo/Kiali)
+WAIT_CLEANUP="${WAIT_CLEANUP:-true}"      # wait for namespaces to be fully deleted (safer for sequential runs)
+CLEANUP_TIMEOUT_SEC="${CLEANUP_TIMEOUT_SEC:-300}"
+WAIT_POLL_SEC="${WAIT_POLL_SEC:-2}"
 
 KIALI_DEMO="${KIALI_DEMO:-false}"         # deploy background traffic generator + keep resources
-TRAFFIC_NS="${TRAFFIC_NS:-${CLIENT_NS}}" # where to deploy traffic generator (prefer bookinfo)
+# Where to deploy traffic generator. If unset, we set it after selecting a safe client namespace.
+TRAFFIC_NS="${TRAFFIC_NS:-}"
 TRAFFIC_PERIOD_SEC="${TRAFFIC_PERIOD_SEC:-2}"
+
+# Demo enhancements (graph + traces)
+ENABLE_CLIENT_WAYPOINT="${ENABLE_CLIENT_WAYPOINT:-auto}" # auto|true|false ; auto enables when KIALI_DEMO=true
+CLIENT_WAYPOINT_NAME="${CLIENT_WAYPOINT_NAME:-uc11-kuadrant-client}"
+CLIENT_WAYPOINT_CREATED="false"
+DEDICATED_CLIENT_NS_CREATED="false"
+
+# Kiali traces fetch fix for console proxy timeouts.
+# Some Kiali builds add slow multi-cluster tag filters (istio.cluster_id) to Tempo queries, which can trigger 504s.
+# If enabled, this patch disables Kiali multi-cluster autodetection so trace searches are faster.
+KIALI_TRACES_PATCH="${KIALI_TRACES_PATCH:-false}" # true|false
+KIALI_CTX="${KIALI_CTX:-${ACM_CTX}}"
+KIALI_NS="${KIALI_NS:-istio-system}"
+KIALI_TRACES_BACKUP_CM="${KIALI_TRACES_BACKUP_CM:-uc11-kuadrant-kiali-config-backup}"
 
 BUILD_MODE="${BUILD_MODE:-binary}" # binary|git|prebuilt
 GIT_REPO_URL="${GIT_REPO_URL:-}"
@@ -85,6 +105,19 @@ pause() {
   read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
 }
 
+wait_ns_deleted() {
+  local ns="$1"
+  local deadline=$(( $(date +%s) + CLEANUP_TIMEOUT_SEC ))
+  while oc --context "$CTX" get ns "$ns" >/dev/null 2>&1; do
+    if [[ $(date +%s) -ge $deadline ]]; then
+      echo -e "  ${WARN} Namespace ${BOLD}${ns}${RESET} still exists (Terminating?) after ${CLEANUP_TIMEOUT_SEC}s"
+      return 0
+    fi
+    sleep "${WAIT_POLL_SEC}"
+  done
+  return 0
+}
+
 header() {
   echo ""
   echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -97,12 +130,127 @@ section() {
   echo -e "${BOLD}▸ $1${RESET}"
 }
 
+ns_is_ambient() {
+  local ns="$1"
+  local mode
+  mode="$(oc --context "$CTX" get ns "$ns" -o jsonpath='{.metadata.labels.istio\.io/dataplane-mode}' 2>/dev/null || true)"
+  [[ "${mode}" == "ambient" ]]
+}
+
+ensure_demo_client_ns() {
+  # For Kiali demo, avoid touching bookinfo; create a dedicated ambient namespace for traffic generator.
+  if [[ "${KIALI_DEMO}" != "true" ]]; then
+    : "${TRAFFIC_NS:=${CLIENT_NS}}"
+    return 0
+  fi
+  if [[ -n "${TRAFFIC_NS}" && "${TRAFFIC_NS}" != "bookinfo" ]]; then
+    return 0
+  fi
+
+  local ns="${CLIENT_NS_FALLBACK}"
+  section "Demo: create dedicated client namespace ${ns} (ambient) for traffic + traces"
+  oc --context "$CTX" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${ns}
+  labels:
+    istio.io/dataplane-mode: ambient
+EOF
+  DEDICATED_CLIENT_NS_CREATED="true"
+  TRAFFIC_NS="${ns}"
+}
+
+ensure_client_waypoint_for_demo() {
+  local enabled="${ENABLE_CLIENT_WAYPOINT}"
+  if [[ "${enabled}" == "auto" ]]; then
+    enabled="$([[ "${KIALI_DEMO}" == "true" ]] && echo true || echo false)"
+  fi
+  if [[ "${enabled}" != "true" ]]; then
+    return 0
+  fi
+  if [[ "${DEDICATED_CLIENT_NS_CREATED}" != "true" ]]; then
+    return 0
+  fi
+  section "Demo: create client waypoint (${TRAFFIC_NS}/${CLIENT_WAYPOINT_NAME}) for L7 graph + traces"
+  istioctl --context "$CTX" waypoint apply --enroll-namespace --name "${CLIENT_WAYPOINT_NAME}" --namespace "${TRAFFIC_NS}" >/dev/null 2>&1 || true
+  if oc --context "$CTX" wait --for=condition=Ready pod -n "${TRAFFIC_NS}" -l gateway.networking.k8s.io/gateway-name="${CLIENT_WAYPOINT_NAME}" --timeout=180s >/dev/null 2>&1; then
+    CLIENT_WAYPOINT_CREATED="true"
+    echo -e "  ${PASS} Client waypoint pod is Ready"
+  else
+    echo -e "  ${WARN} Client waypoint did not become Ready in time (traces may be limited)"
+  fi
+}
 need_cmd() {
   local c="$1"
   if ! command -v "$c" >/dev/null 2>&1; then
     echo -e "  ${FAIL} Missing command: ${BOLD}${c}${RESET}"
     exit 1
   fi
+}
+
+kiali_patch_traces_if_needed() {
+  if [[ "${KIALI_TRACES_PATCH}" != "true" ]]; then
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "  ${WARN} python3 not found; skipping Kiali traces patch."
+    return 0
+  fi
+
+  section "Demo: patch Kiali config to speed up trace searches"
+  echo -e "  Target: context=${BOLD}${KIALI_CTX}${RESET} namespace=${BOLD}${KIALI_NS}${RESET} configmap=${BOLD}kiali${RESET}"
+
+  # Backup current config.yaml into a separate ConfigMap (so we can restore later).
+  cfg="$(oc --context "${KIALI_CTX}" -n "${KIALI_NS}" get cm kiali -o jsonpath='{.data.config\\.yaml}' 2>/dev/null || true)"
+  if [[ -z "${cfg}" ]]; then
+    echo -e "  ${WARN} Could not read Kiali config.yaml; skipping patch."
+    return 0
+  fi
+
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${KIALI_TRACES_BACKUP_CM}
+  namespace: ${KIALI_NS}
+  labels:
+    app: uc11-demo
+data:
+  config.yaml: |
+$(printf '%s\n' "${cfg}" | sed 's/^/    /')
+EOF
+
+  # Patch: disable multi-cluster autodetection to avoid adding istio.cluster_id tag filters in trace searches.
+  patched="$(printf '%s\n' "${cfg}" | python3 - <<'PY'
+import sys,re
+s=sys.stdin.read()
+s=re.sub(r'(^clustering:\n(?:[ ]{2}.*\n)*?[ ]{2}autodetect_secrets:\n(?:[ ]{4}.*\n)*?[ ]{4}enabled:)[ ]*true\b',
+         r'\1 false', s, flags=re.M)
+print(s)
+PY
+)"
+
+  if [[ "${patched}" == "${cfg}" ]]; then
+    echo -e "  ${WARN} Kiali config did not match expected pattern; no changes applied."
+    echo -e "       Restore later (if needed): bash ossm/uc11/uc11-kiali-traces-restore.sh"
+    return 0
+  fi
+
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" patch cm kiali --type merge \
+    -p "$(python3 - <<PY
+import json
+data={"data":{"config.yaml":"""${patched}""" }}
+print(json.dumps(data))
+PY
+)" >/dev/null
+
+  echo -e "  ${PASS} Patched Kiali configmap; restarting Kiali"
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" rollout restart deploy/kiali >/dev/null 2>&1 || true
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" rollout status deploy/kiali --timeout=180s >/dev/null 2>&1 || true
+  echo -e "  ${PASS} Kiali restarted"
+  echo -e "  ${CYAN}Restore later:${RESET} BACKUP_CM=${KIALI_TRACES_BACKUP_CM} bash ossm/uc11/uc11-kiali-traces-restore.sh"
 }
 
 build_legacy_image() {
@@ -268,6 +416,26 @@ cleanup() {
   istioctl --context "$CTX" waypoint delete --namespace "$EGRESS_NS" "$WAYPOINT_NAME" >/dev/null 2>&1 || true
   oc --context "$CTX" --request-timeout=10s delete namespace "$EGRESS_NS" --wait=false 2>/dev/null || true
   oc --context "$CTX" --request-timeout=10s delete namespace "$LEGACY_NS" --wait=false 2>/dev/null || true
+
+  if [[ "${DEDICATED_CLIENT_NS_CREATED}" == "true" ]]; then
+    if [[ "${CLIENT_WAYPOINT_CREATED}" == "true" ]]; then
+      istioctl --context "$CTX" waypoint delete --namespace "$TRAFFIC_NS" "$CLIENT_WAYPOINT_NAME" >/dev/null 2>&1 || true
+    fi
+    oc --context "$CTX" --request-timeout=10s delete namespace "$TRAFFIC_NS" --wait=false 2>/dev/null || true
+  else
+    oc --context "$CTX" delete deploy uc11-kuadrant-traffic -n "$TRAFFIC_NS" 2>/dev/null || true
+  fi
+
+  if [[ "${WAIT_CLEANUP}" == "true" ]]; then
+    echo -e "  ${CYAN}Waiting for namespaces to be deleted (sequential-run safety)...${RESET}"
+    wait_ns_deleted "$GW_NS"
+    wait_ns_deleted "$PROBE_NS"
+    wait_ns_deleted "$EGRESS_NS"
+    wait_ns_deleted "$LEGACY_NS"
+    if [[ "${DEDICATED_CLIENT_NS_CREATED}" == "true" ]]; then
+      wait_ns_deleted "$TRAFFIC_NS"
+    fi
+  fi
 }
 
 trap cleanup EXIT
@@ -359,8 +527,29 @@ need_cmd oc
 need_cmd istioctl
 need_cmd curl
 
+ensure_demo_client_ns
+ensure_client_waypoint_for_demo
+
 header "${UC_ID}: Legacy TLS Origination (${UC_TITLE}) — ${UC_VARIANT}"
 echo -e "  Context: ${BOLD}${CTX}${RESET}"
+
+section "Tracing prerequisites (for Kiali Traces)"
+tracing_enabled="$(oc --context "$CTX" -n istio-system get istio default -o jsonpath='{.spec.values.meshConfig.enableTracing}' 2>/dev/null || true)"
+tracing_sampling="$(oc --context "$CTX" -n istio-system get istio default -o jsonpath='{.spec.values.meshConfig.defaultConfig.tracing.sampling}' 2>/dev/null || true)"
+if [[ "$tracing_enabled" == "true" ]]; then
+  echo -e "  ${PASS} Istio tracing enabled (sampling=${BOLD}${tracing_sampling:-?}${RESET})"
+else
+  echo -e "  ${WARN} Istio tracing not detected in Istio CR (spec.values.meshConfig.enableTracing). Traces may not appear in Kiali."
+fi
+tempo_jaeger_host="$(oc --context "${ACM_CTX}" -n istio-system get route tempo-jaeger-query -o jsonpath='{.spec.host}' 2>/dev/null || true)"
+if [[ -n "${tempo_jaeger_host}" ]]; then
+  echo -e "  ${PASS} Tempo (Jaeger Query API) route: ${BOLD}https://${tempo_jaeger_host}${RESET}"
+else
+  echo -e "  ${WARN} Tempo route not found on context ${BOLD}${ACM_CTX}${RESET} (route tempo-jaeger-query)."
+fi
+
+# Optional: patch Kiali to avoid slow multi-cluster trace searches (504s).
+kiali_patch_traces_if_needed
 
 section "1. Verify prerequisites (DNS capture + Kuadrant CRDs)"
 dns_capture=$(oc --context "$CTX" get istiocni default -o jsonpath='{.spec.values.cni.ambient.dnsCapture}' 2>/dev/null || true)
@@ -959,8 +1148,27 @@ if [[ "${KIALI_DEMO}" == "true" ]]; then
   deploy_kiali_traffic_kuadrant
   echo ""
   echo -e "  ${WARN} Resources are being kept for demo (KIALI_DEMO=true)."
-  echo -e "  To cleanup later, delete namespaces:"
+  echo -e "  To cleanup later, delete ONLY demo namespaces (safe):"
   echo -e "    oc --context ${CTX} delete ns ${TRAFFIC_NS} ${GW_NS} ${PROBE_NS} ${EGRESS_NS} ${LEGACY_NS} --wait=false"
+  echo -e "  Or run the cleanup helper:"
+  echo -e "    bash ossm/uc11/uc11-kuadrant-demo-cleanup.sh ${CTX}"
+  echo ""
+  echo -e "  ${CYAN}Kiali graph namespaces:${RESET}"
+  echo -e "    - ${BOLD}${TRAFFIC_NS}${RESET} (client)"
+  echo -e "    - ${BOLD}${GW_NS}${RESET} (Gateway)"
+  echo -e "    - ${BOLD}${PROBE_NS}${RESET} (legacy-probe)"
+  echo -e "    - ${BOLD}${EGRESS_NS}${RESET} (waypoint + connectors)"
+  echo -e "    - ${BOLD}${LEGACY_NS}${RESET} (backend)"
+  echo -e "  ${CYAN}Traces tip:${RESET}"
+  echo -e "    - ${BOLD}401 (unauthorized)${RESET} is enforced at the edge Gateway."
+  echo -e "      Look in Kiali at: ${BOLD}${GW_NS}${RESET} -> ${BOLD}Workloads${RESET} -> ${BOLD}legacy-api-istio${RESET} -> Traces."
+  echo -e "      (In this Kiali build, ${BOLD}Services -> Traces${RESET} may show 'No traces' due to a bad Tempo query like ${BOLD}service=.${GW_NS}${RESET}.)"
+  echo -e "      Alternative: ${BOLD}View in Tracing${RESET} and search for service ${BOLD}legacy-api-istio.${GW_NS}${RESET}."
+  echo -e "    - If Traces listing fails with ${BOLD}504${RESET} (timeout), re-run with:"
+  echo -e "      ${BOLD}KIALI_TRACES_PATCH=true${RESET} (restorable via ${BOLD}ossm/uc11/uc11-kiali-traces-restore.sh${RESET})."
+  echo -e "    - ${BOLD}200${RESET} (authorized) and strict-path failures (5xx) continue downstream and can be seen at:"
+  echo -e "      - waypoint ${BOLD}${EGRESS_NS}/${WAYPOINT_NAME}${RESET}"
+  echo -e "      - ${BOLD}${LEGACY_NS}/${LEGACY_APP}${RESET}"
   exit 0
 fi
 
@@ -1033,12 +1241,20 @@ header "Results"
 echo ""
 echo -e "  | Check                        | Expected | Got  | Result |"
 echo -e "  |-----------------------------|----------|------|--------|"
+printf "  | /modern (no auth)            | non-200  | %s  | %b |\n" \
+  "$modern_code" "$([ "$modern_code" != "200" ] && echo -e "${PASS}" || echo -e "${WARN}")"
 printf "  | /legacy without auth         | 401      | %s  | %b |\n" \
   "$legacy_noauth_code" "$([ "$legacy_noauth_code" = "401" ] && echo -e "${PASS}" || echo -e "${FAIL}")"
 printf "  | /legacy with API key         | 200      | %s  | %b |\n" \
   "$legacy_auth_code" "$([ "$legacy_auth_code" = "200" ] && echo -e "${PASS}" || echo -e "${FAIL}")"
 printf "  | legacy TLS cipher visible    | present  |  -   | %b |\n" \
   "$([ "$test_cipher" = "pass" ] && echo -e "${PASS}" || echo -e "${WARN}")"
+echo ""
+
+echo -e "  ${BOLD}Meaning (for Kiali/Traces):${RESET}"
+echo -e "    - ${BOLD}/modern${RESET}: should typically be ${BOLD}503/504/ERROR${RESET} (strict TLS path → legacy TLS1.0 backend fails)"
+echo -e "    - ${BOLD}/legacy without auth${RESET}: ${BOLD}401${RESET} (Kuadrant AuthPolicy rejects missing API key)"
+echo -e "    - ${BOLD}/legacy with API key${RESET}: ${BOLD}200${RESET} (authorized + downgrade header injected → compat path succeeds)"
 echo ""
 
 if [[ "$legacy_noauth_code" = "401" && "$legacy_auth_code" = "200" ]]; then

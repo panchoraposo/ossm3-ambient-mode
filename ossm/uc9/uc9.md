@@ -2,12 +2,12 @@
 
 ## Objective
 
-Demostrar el caso donde un destino externo usa un **certificado no público** (self-signed o CA privada) y se requiere un manejo **por-destino** para confiar en esa CA **sin** relajar la verificación TLS para el resto del mesh.
+Demonstrate the case where an external/legacy destination uses a **non-public certificate** (self-signed or private CA) and we need **per-destination trust** without weakening TLS verification for the rest of the mesh.
 
-En este demo:
+In this demo:
 
-- La ruta “default/strict” **no** confía en la CA privada → falla el handshake TLS.
-- La ruta “custom-ca” usa una CA dedicada **solo** para ese destino → funciona.
+- The **default/strict** path does **not** trust the private CA → TLS verification fails.
+- The **custom-ca** path uses a dedicated CA **only** for that destination → it works.
 
 ## Quick Run
 
@@ -15,26 +15,26 @@ En este demo:
 ./ossm/uc9-verify.sh east
 ```
 
-Para WEST:
+For WEST:
 
 ```bash
 ./ossm/uc9-verify.sh west
 ```
 
-Variables útiles:
+Useful variables:
 
 - `AUTO_ENABLE_DNS_CAPTURE=true`: auto-habilita DNS capture si está apagado
 - `KEEP_RESOURCES_ON_FAIL=true`: deja recursos para inspección
-- `NO_PAUSE=true`: modo no interactivo
-- `CUSTOM_CA_HEADER=x-bank-custom-ca`: header que activa la ruta con CA custom (por defecto `x-bank-custom-ca: true`)
-- `BUILD_MODE=binary|git|prebuilt`: controla cómo se obtiene la imagen (por defecto: `binary`)
-  - `binary`: usa `start-build --from-dir` (hace upload; permite probar sin pushear cambios)
-  - `git`: el build se hace en-cluster clonando el repo (evita el “upload” del directorio local; requiere que el repo remoto tenga `ossm/uc9/...`)
-  - `prebuilt`: no construye; usa `CUSTOM_CERT_SERVER_IMAGE` y `HAPROXY_IMAGE`
-- `GIT_REPO_URL=https://...`: fuerza la URL del repo para `BUILD_MODE=git`
-- `IMAGE_BUILD_NS=uc-images`: namespace **no ambient** donde corren los Builds (evita que aparezcan en Kiali)
-- `KIALI_DEMO=true`: despliega un generador de tráfico en background y **no** limpia recursos (para mostrar en Kiali)
-- `TRAFFIC_PERIOD_SEC=2`: intervalo entre requests del generador
+- `NO_PAUSE=true`: non-interactive mode
+- `CUSTOM_CA_HEADER=x-bank-custom-ca`: header that enables the custom-CA path (default: `x-bank-custom-ca: true`)
+- `BUILD_MODE=binary|git|prebuilt`: how images are obtained (default: `binary`)
+  - `binary`: uses `start-build --from-dir` (uploads local dir; good for local testing without pushing)
+  - `git`: build happens in-cluster from a Git repo (avoids local upload; requires the remote repo contains `ossm/uc9/...`)
+  - `prebuilt`: no build; uses `CUSTOM_CERT_SERVER_IMAGE` and `HAPROXY_IMAGE`
+- `GIT_REPO_URL=https://...`: forces the repo URL for `BUILD_MODE=git`
+- `IMAGE_BUILD_NS=uc-images`: **non-ambient** namespace for Builds (keeps build pods out of Kiali graphs)
+- `KIALI_DEMO=true`: deploys a background traffic generator and **skips cleanup** (better for Kiali demos)
+- `TRAFFIC_PERIOD_SEC=2`: traffic generator period (seconds)
 
 ## Expected Results
 
@@ -43,21 +43,35 @@ Variables útiles:
 | `GET http://customcert.bank.demo/` | *(none)* | **FAIL** |
 | `GET http://customcert.bank.demo/` | `true` | **200 OK** |
 
-## Demo en Kiali (pasos)
+## What to verify in Kiali Traces (expected)
 
-1) Ejecuta UC9 en modo demo:
+When you test UC9, you should see **two distinct operations** (two connectors) with different results:
+
+- **Strict path (expected failure)**:
+  - **Operation**: `custom-cert-connector-strict.egress-custom-cert.svc.cluster.local:8080/*`
+  - **Response status**: **503**
+- **Custom CA path (expected success)**:
+  - **Operation**: `custom-cert-connector-customca.egress-custom-cert.svc.cluster.local:8080/*`
+  - **Response status**: **200**
+
+This is the core validation: **only** the custom-CA connector trusts the private CA.
+
+## Kiali demo (steps)
+
+1) Run UC9 in demo mode:
 
 ```bash
 NO_PAUSE=true KIALI_DEMO=true ./ossm/uc9-verify.sh east
 ```
 
-2) Abre Kiali y mira el **Graph** (Workload graph) para estos namespaces:
+2) Open Kiali and look at the **Graph** (Workload graph) for these namespaces:
 
 - `bookinfo` (cliente/generador; o el que uses como `TRAFFIC_NS`)
 - `egress-custom-cert` (waypoint + connectors)
 - `custom-cert-backend` (backend TLS con CA privada)
 
-3) Espera 1–2 minutos y selecciona rango “Last 1m/5m”. Deberías ver:
+3) Wait 1–2 minutes and select “Last 1m/5m”. You should see traffic alternating between:
 
-- tráfico alternando hacia **strict connector** (errores de verificación) y **custom-ca connector** (OK)
+- **strict connector** (TLS verification errors → 503)
+- **custom-ca connector** (success → 200)
 

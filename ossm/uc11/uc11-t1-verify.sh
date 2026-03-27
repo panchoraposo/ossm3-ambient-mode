@@ -22,18 +22,37 @@ UC_ID="${UC_ID:-UC11}"
 UC_TITLE="${UC_TITLE:-Special Ciphers}"
 UC_DIR="${UC_DIR:-ossm/uc11}"
 RUN_HINT="${RUN_HINT:-./${0##*/}}"
+ACM_CTX="${ACM_CTX:-acm}" # where centralized Kiali/Tempo live (if installed)
 
 CLIENT_NS="${CLIENT_NS:-bookinfo}"
 CLIENT_LABEL="${CLIENT_LABEL:-app=productpage}"
+CLIENT_NS_FALLBACK="${CLIENT_NS_FALLBACK:-uc11-client}"
 AUTO_ENABLE_DNS_CAPTURE="${AUTO_ENABLE_DNS_CAPTURE:-false}"
 KEEP_RESOURCES_ON_FAIL="${KEEP_RESOURCES_ON_FAIL:-false}"
 KEEP_RESOURCES="${KEEP_RESOURCES:-false}" # keep resources even on success (demo/Kiali)
+WAIT_CLEANUP="${WAIT_CLEANUP:-true}"      # wait for namespaces to be fully deleted (safer for sequential runs)
+CLEANUP_TIMEOUT_SEC="${CLEANUP_TIMEOUT_SEC:-300}"
+WAIT_POLL_SEC="${WAIT_POLL_SEC:-2}"
 NO_PAUSE="${NO_PAUSE:-false}"
 CLIENT_MODE="${CLIENT_MODE:-auto}" # auto|force-client-pod
 
 KIALI_DEMO="${KIALI_DEMO:-false}"         # deploy background traffic generator + keep resources
-TRAFFIC_NS="${TRAFFIC_NS:-${CLIENT_NS}}" # where to deploy traffic generator (prefer bookinfo)
+# Where to deploy traffic generator. If unset, we set it after selecting the client namespace.
+TRAFFIC_NS="${TRAFFIC_NS:-}"
 TRAFFIC_PERIOD_SEC="${TRAFFIC_PERIOD_SEC:-2}"
+
+# Demo enhancements (graph + traces)
+ENABLE_CLIENT_WAYPOINT="${ENABLE_CLIENT_WAYPOINT:-auto}" # auto|true|false ; auto enables when KIALI_DEMO=true
+CLIENT_WAYPOINT_NAME="${CLIENT_WAYPOINT_NAME:-uc11-client}"
+CLIENT_WAYPOINT_CREATED="false"
+
+# Kiali traces fetch fix for console proxy timeouts.
+# Some Kiali builds add slow multi-cluster tag filters (istio.cluster_id) to Tempo queries, which can trigger 504s.
+# If enabled, this patch disables Kiali multi-cluster autodetection so trace searches are faster.
+KIALI_TRACES_PATCH="${KIALI_TRACES_PATCH:-false}" # true|false
+KIALI_CTX="${KIALI_CTX:-${ACM_CTX}}"
+KIALI_NS="${KIALI_NS:-istio-system}"
+KIALI_TRACES_BACKUP_CM="${KIALI_TRACES_BACKUP_CM:-uc11-kiali-config-backup}"
 
 BUILD_MODE="${BUILD_MODE:-binary}" # binary|git|prebuilt
 GIT_REPO_URL="${GIT_REPO_URL:-}"
@@ -69,6 +88,19 @@ pause() {
   read -rp "  ⏎ ${1:-Press ENTER to continue...} " _
 }
 
+wait_ns_deleted() {
+  local ns="$1"
+  local deadline=$(( $(date +%s) + CLEANUP_TIMEOUT_SEC ))
+  while oc --context "$CTX" get ns "$ns" >/dev/null 2>&1; do
+    if [[ $(date +%s) -ge $deadline ]]; then
+      echo -e "  ${WARN} Namespace ${BOLD}${ns}${RESET} still exists (Terminating?) after ${CLEANUP_TIMEOUT_SEC}s"
+      return 0
+    fi
+    sleep "${WAIT_POLL_SEC}"
+  done
+  return 0
+}
+
 header() {
   echo ""
   echo -e "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -81,12 +113,130 @@ section() {
   echo -e "${BOLD}▸ $1${RESET}"
 }
 
+ns_is_ambient() {
+  local ns="$1"
+  local mode
+  mode="$(oc --context "$CTX" get ns "$ns" -o jsonpath='{.metadata.labels.istio\.io/dataplane-mode}' 2>/dev/null || true)"
+  [[ "${mode}" == "ambient" ]]
+}
+
+DEDICATED_CLIENT_NS_CREATED="false"
+ensure_client_waypoint_for_demo() {
+  local ns="${CLIENT_NS}"
+
+  local enabled="${ENABLE_CLIENT_WAYPOINT}"
+  if [[ "${enabled}" == "auto" ]]; then
+    if [[ "${KIALI_DEMO}" == "true" ]]; then
+      enabled="true"
+    else
+      enabled="false"
+    fi
+  fi
+  if [[ "${enabled}" != "true" ]]; then
+    return 0
+  fi
+  if [[ "${DEDICATED_CLIENT_NS_CREATED}" != "true" ]]; then
+    # Never create/alter a waypoint in bookinfo or any shared namespace.
+    return 0
+  fi
+
+  section "Demo: create client waypoint (${ns}/${CLIENT_WAYPOINT_NAME}) for L7 graph + traces"
+  istioctl --context "$CTX" waypoint apply --enroll-namespace --name "${CLIENT_WAYPOINT_NAME}" --namespace "${ns}" >/dev/null 2>&1 || true
+  if oc --context "$CTX" wait --for=condition=Ready pod -n "${ns}" -l gateway.networking.k8s.io/gateway-name="${CLIENT_WAYPOINT_NAME}" --timeout=180s >/dev/null 2>&1; then
+    CLIENT_WAYPOINT_CREATED="true"
+    echo -e "  ${PASS} Client waypoint pod is Ready"
+  else
+    echo -e "  ${WARN} Client waypoint did not become Ready in time (traces may be limited)"
+  fi
+}
+
+wait_client_dns() {
+  local host="$1"
+  local pod="$2"
+  local ns="$3"
+  local deadline=$(( $(date +%s) + 90 ))
+  while true; do
+    ok="$(oc --context "$CTX" exec -n "$ns" "$pod" -- python3 -c "import socket; socket.gethostbyname('${host}'); print('OK')" 2>/dev/null || true)"
+    if [[ "$ok" == "OK" ]]; then
+      return 0
+    fi
+    if [[ $(date +%s) -ge $deadline ]]; then
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 need_cmd() {
   local c="$1"
   if ! command -v "$c" >/dev/null 2>&1; then
     echo -e "  ${FAIL} Missing command: ${BOLD}${c}${RESET}"
     exit 1
   fi
+}
+
+kiali_patch_traces_if_needed() {
+  if [[ "${KIALI_TRACES_PATCH}" != "true" ]]; then
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "  ${WARN} python3 not found; skipping Kiali traces patch."
+    return 0
+  fi
+
+  section "Demo: patch Kiali config to speed up trace searches"
+  echo -e "  Target: context=${BOLD}${KIALI_CTX}${RESET} namespace=${BOLD}${KIALI_NS}${RESET} configmap=${BOLD}kiali${RESET}"
+
+  # Backup current config.yaml into a separate ConfigMap (so we can restore later).
+  cfg="$(oc --context "${KIALI_CTX}" -n "${KIALI_NS}" get cm kiali -o jsonpath='{.data.config\\.yaml}' 2>/dev/null || true)"
+  if [[ -z "${cfg}" ]]; then
+    echo -e "  ${WARN} Could not read Kiali config.yaml; skipping patch."
+    return 0
+  fi
+
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ${KIALI_TRACES_BACKUP_CM}
+  namespace: ${KIALI_NS}
+  labels:
+    app: uc11-demo
+data:
+  config.yaml: |
+$(printf '%s\n' "${cfg}" | sed 's/^/    /')
+EOF
+
+  # Patch: disable multi-cluster autodetection to avoid adding istio.cluster_id tag filters in trace searches.
+  patched="$(printf '%s\n' "${cfg}" | python3 - <<'PY'
+import sys,re
+s=sys.stdin.read()
+s=re.sub(r'(^clustering:\n(?:[ ]{2}.*\n)*?[ ]{2}autodetect_secrets:\n(?:[ ]{4}.*\n)*?[ ]{4}enabled:)[ ]*true\b',
+         r'\1 false', s, flags=re.M)
+print(s)
+PY
+)"
+
+  if [[ "${patched}" == "${cfg}" ]]; then
+    echo -e "  ${WARN} Kiali config did not match expected pattern; no changes applied."
+    echo -e "       Restore later (if needed): bash ossm/uc11/uc11-kiali-traces-restore.sh"
+    return 0
+  fi
+
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" patch cm kiali --type merge \
+    -p "$(python3 - <<PY
+import json
+data={"data":{"config.yaml":"""${patched}""" }}
+print(json.dumps(data))
+PY
+)" >/dev/null
+
+  echo -e "  ${PASS} Patched Kiali configmap; restarting Kiali"
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" rollout restart deploy/kiali >/dev/null 2>&1 || true
+  oc --context "${KIALI_CTX}" -n "${KIALI_NS}" rollout status deploy/kiali --timeout=180s >/dev/null 2>&1 || true
+  echo -e "  ${PASS} Kiali restarted"
+  echo -e "  ${CYAN}Restore later:${RESET} BACKUP_CM=${KIALI_TRACES_BACKUP_CM} bash ossm/uc11/uc11-kiali-traces-restore.sh"
 }
 
 build_legacy_image() {
@@ -237,10 +387,21 @@ metadata:
     app: legacy-client
 spec:
   restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
   containers:
   - name: client
     image: registry.access.redhat.com/ubi9/python-311
     imagePullPolicy: IfNotPresent
+    securityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities:
+        drop: ["ALL"]
     command: ["sh","-lc"]
     args: ["sleep 3600"]
 EOF
@@ -281,7 +442,26 @@ cleanup() {
   istioctl --context "$CTX" waypoint delete --namespace "$EGRESS_NS" "$WAYPOINT_NAME" >/dev/null 2>&1 || true
   oc --context "$CTX" --request-timeout=10s delete namespace "$EGRESS_NS" --wait=false 2>/dev/null || true
   oc --context "$CTX" --request-timeout=10s delete namespace "$LEGACY_NS" --wait=false 2>/dev/null || true
-  oc --context "$CTX" delete pod legacy-client -n "$CLIENT_NS" 2>/dev/null || true
+  if [[ "${DEDICATED_CLIENT_NS_CREATED}" == "true" ]]; then
+    if [[ "${CLIENT_WAYPOINT_CREATED}" == "true" ]]; then
+      istioctl --context "$CTX" waypoint delete --namespace "$CLIENT_NS_FALLBACK" "$CLIENT_WAYPOINT_NAME" >/dev/null 2>&1 || true
+    fi
+    oc --context "$CTX" --request-timeout=10s delete namespace "$CLIENT_NS_FALLBACK" --wait=false 2>/dev/null || true
+  else
+    # Never delete anything in bookinfo; only delete the ad-hoc client pod if it exists in a non-shared namespace.
+    if [[ "${CLIENT_NS}" != "bookinfo" ]]; then
+      oc --context "$CTX" delete pod legacy-client -n "$CLIENT_NS" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "${WAIT_CLEANUP}" == "true" ]]; then
+    echo -e "  ${CYAN}Waiting for namespaces to be deleted (sequential-run safety)...${RESET}"
+    wait_ns_deleted "$EGRESS_NS"
+    wait_ns_deleted "$LEGACY_NS"
+    if [[ "${DEDICATED_CLIENT_NS_CREATED}" == "true" ]]; then
+      wait_ns_deleted "$CLIENT_NS_FALLBACK"
+    fi
+  fi
 }
 
 trap cleanup EXIT
@@ -354,13 +534,94 @@ need_cmd istioctl
 header "${UC_ID}: Legacy TLS Origination (${UC_TITLE}) — Istio-only"
 echo -e "  Context: ${BOLD}${CTX}${RESET}"
 
-section "1. Verify prerequisites (bookinfo + DNS capture)"
-PRODUCTPAGE_POD=$(oc --context "$CTX" get pods -n "$CLIENT_NS" -l "$CLIENT_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-if [[ -z "${PRODUCTPAGE_POD}" ]]; then
-  echo -e "  ${FAIL} Could not find client pod in ${BOLD}${CLIENT_NS}${RESET} with label ${BOLD}${CLIENT_LABEL}${RESET}"
-  exit 1
+section "Tracing prerequisites (for Kiali Traces)"
+tracing_enabled="$(oc --context "$CTX" -n istio-system get istio default -o jsonpath='{.spec.values.meshConfig.enableTracing}' 2>/dev/null || true)"
+tracing_sampling="$(oc --context "$CTX" -n istio-system get istio default -o jsonpath='{.spec.values.meshConfig.defaultConfig.tracing.sampling}' 2>/dev/null || true)"
+if [[ "$tracing_enabled" == "true" ]]; then
+  echo -e "  ${PASS} Istio tracing enabled (sampling=${BOLD}${tracing_sampling:-?}${RESET})"
+else
+  echo -e "  ${WARN} Istio tracing not detected in Istio CR (spec.values.meshConfig.enableTracing). Traces may not appear in Kiali."
 fi
-echo -e "  ${PASS} Client pod: ${BOLD}${PRODUCTPAGE_POD}${RESET}"
+tempo_jaeger_host="$(oc --context "${ACM_CTX}" -n istio-system get route tempo-jaeger-query -o jsonpath='{.spec.host}' 2>/dev/null || true)"
+if [[ -n "${tempo_jaeger_host}" ]]; then
+  echo -e "  ${PASS} Tempo (Jaeger Query API) route: ${BOLD}https://${tempo_jaeger_host}${RESET}"
+else
+  echo -e "  ${WARN} Tempo route not found on context ${BOLD}${ACM_CTX}${RESET} (route tempo-jaeger-query)."
+fi
+
+# Optional: patch Kiali to avoid slow multi-cluster trace searches (504s).
+kiali_patch_traces_if_needed
+
+section "1. Verify prerequisites (client + DNS capture)"
+PRODUCTPAGE_POD=""
+orig_client_ns="${CLIENT_NS}"
+
+if [[ "${CLIENT_MODE}" != "force-client-pod" ]]; then
+  PRODUCTPAGE_POD=$(oc --context "$CTX" get pods -n "$CLIENT_NS" -l "$CLIENT_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+fi
+
+# In demo mode, never depend on bookinfo (it is usually not ambient-enrolled).
+if [[ "${KIALI_DEMO}" == "true" && "${CLIENT_NS}" == "bookinfo" ]]; then
+  PRODUCTPAGE_POD=""
+fi
+
+if [[ -n "${PRODUCTPAGE_POD}" ]] && ! ns_is_ambient "${CLIENT_NS}"; then
+  echo -e "  ${WARN} Found client pod in ${BOLD}${CLIENT_NS}${RESET}, but namespace is not labeled ${BOLD}istio.io/dataplane-mode=ambient${RESET}."
+  echo -e "       Using dedicated ambient client namespace ${BOLD}${CLIENT_NS_FALLBACK}${RESET} (no changes to ${BOLD}${orig_client_ns}${RESET})."
+  PRODUCTPAGE_POD=""
+fi
+
+if [[ -z "${PRODUCTPAGE_POD}" ]]; then
+  echo -e "  ${WARN} Could not find usable ambient client pod in ${BOLD}${orig_client_ns}${RESET}."
+  echo -e "       Creating a dedicated ambient client pod in ${BOLD}${CLIENT_NS_FALLBACK}${RESET}..."
+
+  CLIENT_NS="${CLIENT_NS_FALLBACK}"
+  oc --context "$CTX" apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${CLIENT_NS}
+  labels:
+    istio.io/dataplane-mode: ambient
+EOF
+  DEDICATED_CLIENT_NS_CREATED="true"
+  PRODUCTPAGE_POD="legacy-client"
+  oc --context "$CTX" apply -f - <<EOF >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${PRODUCTPAGE_POD}
+  namespace: ${CLIENT_NS}
+  labels:
+    app: legacy-client
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+  - name: client
+    image: registry.access.redhat.com/ubi9/python-311
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities:
+        drop: ["ALL"]
+    command: ["sh","-lc"]
+    args: ["sleep 3600"]
+EOF
+  oc --context "$CTX" wait --for=condition=Ready pod/${PRODUCTPAGE_POD} -n "${CLIENT_NS}" --timeout=180s >/dev/null
+  echo -e "  ${PASS} Client pod (dedicated): ${BOLD}${CLIENT_NS}/${PRODUCTPAGE_POD}${RESET}"
+else
+  echo -e "  ${PASS} Client pod: ${BOLD}${CLIENT_NS}/${PRODUCTPAGE_POD}${RESET}"
+fi
+
+: "${TRAFFIC_NS:=${CLIENT_NS}}"
+ensure_client_waypoint_for_demo
 
 dns_capture=$(oc --context "$CTX" get istiocni default -o jsonpath='{.spec.values.cni.ambient.dnsCapture}' 2>/dev/null || true)
 if [[ "$dns_capture" != "true" ]]; then
@@ -702,10 +963,20 @@ pause "Press ENTER to run tests from the modern client (productpage)..."
 
 header "Phase: Tests"
 
+section "6.5 Wait for DNS capture to resolve ${HOST_FRONT} from client"
+if wait_client_dns "${HOST_FRONT}" "${PRODUCTPAGE_POD}" "${CLIENT_NS}"; then
+  echo -e "  ${PASS} Client can resolve ${BOLD}${HOST_FRONT}${RESET}"
+else
+  echo -e "  ${FAIL} Client could not resolve ${BOLD}${HOST_FRONT}${RESET} after 90s (DNS capture/ServiceEntry not effective)."
+  echo -e "       Tip: ensure the client namespace is ambient-enrolled and ztunnel is healthy."
+  exit 1
+fi
+
 section "7. Test without downgrade header (expected FAIL)"
 nohdr=$(run_client_http "" | tr -d '\r')
 echo -e "  Result: ${BOLD}${nohdr}${RESET}"
-if echo "$nohdr" | grep -q '^OK|200'; then
+nohdr_code="$(extract_http_code "$nohdr")"
+if [[ "${nohdr_code}" == "200" ]]; then
   echo -e "  ${WARN} Unexpected success (strict path should usually fail against TLS1.0-only backend)"
 else
   echo -e "  ${PASS} Strict path failed as expected"
@@ -714,13 +985,29 @@ fi
 section "8. Test WITH downgrade header (expected 200)"
 withhdr=$(run_client_http "true" | tr -d '\r')
 echo -e "  Result: ${BOLD}${withhdr}${RESET}"
-if echo "$withhdr" | grep -q '^OK|200'; then
+withhdr_code="$(extract_http_code "$withhdr")"
+if [[ "${withhdr_code}" == "200" ]]; then
   echo -e "  ${PASS} Compat path succeeded (TLS origination to legacy backend works)"
   test_ok="pass"
 else
   echo -e "  ${FAIL} Compat path did not succeed"
   test_ok="fail"
 fi
+
+extract_http_code() {
+  local s="$1"
+  if echo "$s" | grep -qE '^OK\\|[0-9]{3}\\|'; then
+    echo "$s" | awk -F'|' '{print $2}'
+    return 0
+  fi
+  if echo "$s" | grep -qE '^HTTPERROR\\|[0-9]{3}\\|'; then
+    echo "$s" | awk -F'|' '{print $2}'
+    return 0
+  fi
+  echo "ERROR"
+}
+
+# (codes already extracted above)
 
 section "9. Validate negotiated protocol/cipher in legacy backend logs"
 LEGACY_POD=$(oc --context "$CTX" get pod -n "${LEGACY_NS}" -l app="${LEGACY_APP}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
@@ -742,10 +1029,22 @@ if [[ "${KIALI_DEMO}" == "true" ]]; then
   deploy_kiali_traffic
   echo ""
   echo -e "  ${WARN} Resources are being kept for demo (KIALI_DEMO=true)."
-  echo -e "  To cleanup later, run:"
-  echo -e "    ${BOLD}KEEP_RESOURCES=false KIALI_DEMO=false ./ossm/uc11-verify.sh ${CTX}${RESET}"
-  echo -e "  Or delete namespaces:"
+  echo -e "  To cleanup later, delete ONLY demo namespaces (safe):"
   echo -e "    oc --context ${CTX} delete ns ${TRAFFIC_NS} ${EGRESS_NS} ${LEGACY_NS} --wait=false"
+  echo -e "  Or run the cleanup helper:"
+  echo -e "    bash ossm/uc11/uc11-demo-cleanup.sh ${CTX}"
+  echo ""
+  echo -e "  ${CYAN}Kiali graph namespaces:${RESET}"
+  echo -e "    - ${BOLD}${TRAFFIC_NS}${RESET} (client)"
+  echo -e "    - ${BOLD}${EGRESS_NS}${RESET} (waypoint + connectors)"
+  echo -e "    - ${BOLD}${LEGACY_NS}${RESET} (backend)"
+  echo -e "  ${CYAN}Traces tip:${RESET} click the waypoint node ${BOLD}${EGRESS_NS}/${WAYPOINT_NAME}${RESET} and open Traces (Last 5m)."
+  if [[ "${DEDICATED_CLIENT_NS_CREATED}" == "true" ]]; then
+    echo -e "              also click client waypoint ${BOLD}${TRAFFIC_NS}/${CLIENT_WAYPOINT_NAME}${RESET}."
+  fi
+  echo -e "            If Traces listing fails with ${BOLD}504${RESET} (timeout), re-run with:"
+  echo -e "              ${BOLD}KIALI_TRACES_PATCH=true${RESET} (restorable via ${BOLD}ossm/uc11/uc11-kiali-traces-restore.sh${RESET})."
+  echo -e "  ${CYAN}Note:${RESET} this script does not modify or require deleting ${BOLD}bookinfo${RESET}."
   exit 0
 fi
 
@@ -757,11 +1056,19 @@ echo ""
 echo -e "  | Check                               | Expected | Result |"
 echo -e "  |-------------------------------------|----------|--------|"
 printf   "  | Strict path (no header)             | FAIL     | %b |\n" \
-  "$(! echo "$nohdr" | grep -q '^OK|200' && echo -e "${PASS}" || echo -e "${WARN}")"
+  "$([ "${nohdr_code}" != "200" ] && echo -e "${PASS}" || echo -e "${WARN}")"
 printf   "  | Compat path (header downgrade=true) | 200 OK   | %b |\n" \
   "$([ "$test_ok" = "pass" ] && echo -e "${PASS}" || echo -e "${FAIL}")"
 printf   "  | Legacy logs show TLSv1 + cipher     | present  | %b |\n" \
   "$([ "$test_cipher" = "pass" ] && echo -e "${PASS}" || echo -e "${WARN}")"
+echo ""
+
+echo -e "  ${BOLD}Observed HTTP codes:${RESET}"
+echo -e "    - strict (no header): ${BOLD}${nohdr_code}${RESET}"
+echo -e "    - compat (header ${DOWNGRADE_HEADER}=true): ${BOLD}${withhdr_code}${RESET}"
+echo -e "  ${BOLD}Meaning (for Kiali/Traces):${RESET}"
+echo -e "    - strict: expected ${BOLD}503/504/ERROR${RESET} (TLS1.2 forced to TLS1.0 backend → handshake/timeout)"
+echo -e "    - compat: expected ${BOLD}200${RESET} (TLS1.0 + legacy cipher allowed)"
 echo ""
 
 if [[ "$test_ok" == "pass" ]]; then
