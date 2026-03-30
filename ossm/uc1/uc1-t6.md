@@ -140,10 +140,13 @@ http.inbound_0.0.0.0_9080;.rbac.denied: 18
 
 **Policy — reviews blocked in the UI:**
 
-Open bookinfo in browser — the reviews section shows **"Error fetching product reviews!"** while details and ratings continue working.
+Open bookinfo in browser — the reviews section shows **"Error fetching product reviews!"** while details and ratings continue working. But at the same time `reviews` is still working
 
 ```bash
 curl -s http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage | grep -o "Error fetching product reviews"
+
+curl http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/reviews/0
+
 ```
 
 ### 5. Cleanup

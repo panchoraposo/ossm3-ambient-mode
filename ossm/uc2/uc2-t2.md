@@ -20,7 +20,8 @@ Demonstrate that the mesh enforces access control based on SPIFFE identities (Se
 - Kiali open (OSSMC via ACM console):
   https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
 - Include bookinfo-external namespace in the graph
-
+- Open both sites (nornal) http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage and (external) http://bookinfo-external.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage to confirm both work before applying policies.
+ 
 ## Quick Run
 
 ```bash
