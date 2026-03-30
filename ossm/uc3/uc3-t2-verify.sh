@@ -96,6 +96,8 @@ kind: Service
 metadata:
   name: reviews-v1-only
   namespace: bookinfo
+  labels:
+    app: reviews
 spec:
   ports:
   - port: 9080
@@ -109,6 +111,8 @@ kind: Service
 metadata:
   name: reviews-v3-only
   namespace: bookinfo
+  labels:
+    app: reviews
 spec:
   ports:
   - port: 9080

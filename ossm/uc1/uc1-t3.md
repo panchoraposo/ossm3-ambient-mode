@@ -8,8 +8,7 @@ Verify that both clusters share a trust domain, exchange remote secrets for mutu
 
 - Both clusters running with bookinfo deployed (verified in UC1-T2)
 - `generate-traffic.sh` running
-- Kiali open (OSSMC via ACM console):
-  https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
+- Kiali open (OSSMC via [ACM console](https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph))
 
 ## Quick Run
 

@@ -57,7 +57,7 @@ PIDS+=($!)
 traffic_loop "west" "$URL_WEST" &
 PIDS+=($!)
 
-if [ -n "$URL_EXTERNAL" ]; then
+if [ -n "$ENABLE_EXTERNAL" ] && [ -n "$URL_EXTERNAL" ]; then
   traffic_loop "external" "$URL_EXTERNAL" &
   PIDS+=($!)
 fi

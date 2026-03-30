@@ -56,6 +56,8 @@ oc --context west get peerauthentication -A
 
 Expected: `No resources found`. In ambient mode, mTLS is **always on** — ztunnel enforces it by default without any `PeerAuthentication` resource.
 
+***Note***: if you see any `PeerAuthentication` resources, it might have been created by ConnectivityLink/Kuadrant.
+
 ### 4. Verify SPIFFE identities in traffic
 
 ```bash

@@ -45,7 +45,7 @@ oc --context east get pods -n istio-system -l app=istiod
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage
-curl -s -o /dev/null -w "%{http_code}\n" http://bookinfo.apps.cluster-64k4b.64k4b.sandbox5146.opentlc.com/productpage
+curl -s -o /dev/null -w "%{http_code}\n" http://bookinfo.apps.cluster-7rt9h.7rt9h.sandbox1900.opentlc.com/productpage
 ```
 
 Both should return `200`. Check Kiali on WEST — traffic graph should show normal flow.

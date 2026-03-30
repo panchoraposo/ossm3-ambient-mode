@@ -113,7 +113,7 @@ All pods must show 0 restarts.
 **L4 — ztunnel connection logs:**
 
 ```bash
-oc --context east logs -n ztunnel ds/ztunnel --tail=20 | grep reviews
+oc --context east logs -n ztunnel ds/ztunnel --tail=50 | grep reviews
 ```
 
 Expected: L4 connection entries showing traffic to reviews with SPIFFE identities, bytes, and duration. Note: ztunnel operates at L4 and sees connections, not HTTP-level denials.

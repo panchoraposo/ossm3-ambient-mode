@@ -16,8 +16,10 @@ Demonstrate that the mesh enforces access control based on SPIFFE identities (Se
 - Both clusters running with bookinfo deployed
 - Namespace `bookinfo-external` deployed and enrolled in ambient mode
 - `generate-traffic.sh` running for Kiali visualization
+  - (ENABLE_EXTERNAL=true ./generate-traffic.sh)
 - Kiali open (OSSMC via ACM console):
   https://console-openshift-console.apps.cluster-72nh2.dynamic.redhatworkshops.io/ossmconsole/graph
+- Include bookinfo-external namespace in the graph
 
 ## Quick Run
 

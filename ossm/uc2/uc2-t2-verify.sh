@@ -139,6 +139,8 @@ section "Both Routes should serve reviews normally"
 check_page "Original (bookinfo)" "$EAST_ROUTE" "false"
 check_page "External (bookinfo-external)" "$EXTERNAL_ROUTE" "false"
 
+pause "Press ENTER to show reviews-waypoint..."
+
 # ── Phase 3: Deploy reviews-waypoint ─────────────────────────────────────
 header "3. Deploy reviews-waypoint (L7 proxy for AuthorizationPolicy)"
 

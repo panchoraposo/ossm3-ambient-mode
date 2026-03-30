@@ -175,6 +175,10 @@ EOF
 echo -e "  ${PASS} ${GREEN}reviews-green${RESET} → v1 (no stars)"
 echo -e "  ${PASS} ${CYAN}reviews-blue${RESET}  → v3 (red stars)"
 
+
+pause
+
+
 section "Set HTTPRoute: green=100 / blue=0"
 oc --context east apply -f - <<'EOF' &>/dev/null
 apiVersion: gateway.networking.k8s.io/v1

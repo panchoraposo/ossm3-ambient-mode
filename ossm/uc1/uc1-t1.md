@@ -82,7 +82,7 @@ Expected: `istiod` running in both clusters, `ztunnel` DaemonSet running on each
 | Component | EAST | WEST | ACM |
 |-----------|------|------|-----|
 | OCP Version | 4.20.x | 4.20.x | 4.20.x |
-| Nodes Ready | Yes | Yes | Yes |
+| Node   Ready | Yes | Yes | Yes |
 | OSSM 3 Operator | Succeeded (v3.2.x) | Succeeded (v3.2.x) | N/A |
 | Istio CR | Healthy (v1.27.x) | Healthy (v1.27.x) | N/A |
 | istiod | Running | Running | N/A |

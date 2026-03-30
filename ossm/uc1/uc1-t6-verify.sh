@@ -139,6 +139,8 @@ section "Waiting for waypoint pod to be ready"
 oc --context east wait --for=condition=Ready pod -l gateway.networking.k8s.io/gateway-name=reviews-waypoint -n bookinfo --timeout=60s 2>/dev/null
 echo -e "  ${PASS} Waypoint pod ${GREEN}Ready${RESET}"
 
+pause "Press ENTER to deploy L4 change ..."
+
 # Step 3: Apply L4 + L7 changes simultaneously
 header "3. Apply L4 Change (ztunnel) + L7 Change (waypoint)"
 
@@ -185,6 +187,8 @@ echo -e "  ${PASS} AuthorizationPolicy ${RED}deny-reviews-from-productpage${RESE
 echo ""
 echo -e "  Waiting 10 seconds for propagation..."
 sleep 10
+
+pause "Press ENTER to verify ..."
 
 # Step 4: Verify both changes
 header "4. Verify Both Changes"
