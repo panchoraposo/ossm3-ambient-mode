@@ -19,6 +19,24 @@ PROGRESS_EVERY_SECONDS="${PROGRESS_EVERY_SECONDS:-20}"
 AUTO_ENABLE_WAYPOINTS="${AUTO_ENABLE_WAYPOINTS:-true}"
 DEMO_CLEANUP="${DEMO_CLEANUP:-true}"
 _AUTO_ENABLED_WAYPOINTS="false"
+_SCALED_DOWN="false"
+
+cleanup() {
+  # Always attempt to restore scaled workloads so the cluster is left operational,
+  # even if the demo exits early due to a failed failover check.
+  if [[ "${_SCALED_DOWN}" == "true" ]]; then
+    log "Cleanup: restoring reviews+ratings replicas on ${CTX_EAST}..."
+    scale_reviews_ratings "$CTX_EAST" 1 >/dev/null 2>&1 || true
+    _SCALED_DOWN="false"
+  fi
+
+  if [[ "${DEMO_CLEANUP}" == "true" && "${_AUTO_ENABLED_WAYPOINTS}" == "true" ]]; then
+    disable_bookinfo_waypoints "$CTX_EAST" "$NS" || true
+    disable_bookinfo_waypoints "$CTX_WEST" "$NS" || true
+  fi
+}
+
+trap cleanup EXIT
 
 ensure_curl_pod() {
   if kubectl --context "$CTX_EAST" get pod -n "$NS" "$CURL_POD" >/dev/null 2>&1; then
@@ -216,9 +234,6 @@ main() {
       enable_bookinfo_waypoints "$CTX_EAST" "$NS"
       enable_bookinfo_waypoints "$CTX_WEST" "$NS"
       _AUTO_ENABLED_WAYPOINTS="true"
-      if [[ "${DEMO_CLEANUP}" == "true" ]]; then
-        trap 'if [[ "${_AUTO_ENABLED_WAYPOINTS}" == "true" ]]; then disable_bookinfo_waypoints "$CTX_EAST" "$NS"; disable_bookinfo_waypoints "$CTX_WEST" "$NS"; fi' EXIT
-      fi
     else
       die "Waypoints are not configured in one or both clusters. Set AUTO_ENABLE_WAYPOINTS=true or enable them manually."
     fi
@@ -246,6 +261,7 @@ main() {
   if ! wait_no_pods "$CTX_EAST"; then
     die "East pods did not scale to 0 (still running)."
   fi
+  _SCALED_DOWN="true"
   log "Scaled down on ${CTX_EAST}."
   log ""
 
@@ -264,6 +280,7 @@ main() {
 
   log "Restoring ${CTX_EAST}..."
   scale_reviews_ratings "$CTX_EAST" 1
+  _SCALED_DOWN="false"
   log "Done."
 }
 

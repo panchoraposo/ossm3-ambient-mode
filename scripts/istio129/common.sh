@@ -95,8 +95,8 @@ wait_ready() {
 
 bookinfo_waypoints_configured() {
   local ctx="$1" ns="$2"
-  kubectl --context "$ctx" -n "$ns" get gateway.gateway.networking.k8s.io reviews-waypoint >/dev/null 2>&1 || return 1
-  kubectl --context "$ctx" -n "$ns" get svc reviews -o jsonpath='{.metadata.labels.istio\.io/use-waypoint}' 2>/dev/null | grep -q '^reviews-waypoint$' || return 1
+  kubectl --context "$ctx" -n "$ns" get gateway.gateway.networking.k8s.io waypoint >/dev/null 2>&1 || return 1
+  kubectl --context "$ctx" -n "$ns" get svc reviews -o jsonpath='{.metadata.labels.istio\.io/use-waypoint}' 2>/dev/null | grep -q '^waypoint$' || return 1
   return 0
 }
 
@@ -150,55 +150,21 @@ enable_bookinfo_waypoints() {
 
   log "Enabling Bookinfo waypoints (temporary) on ${ctx}/${ns}..."
 
-  # Ensure per-service waypoint Gateways exist.
-  for wp in productpage-waypoint reviews-waypoint ratings-waypoint details-waypoint; do
-    istioctl --context "$ctx" waypoint apply -n "$ns" --for all --name "$wp" >/dev/null || true
-  done
+  # Use a single namespace waypoint (Istio docs pattern).
+  # On OpenShift, service traffic may appear as "workload" at interception time (DNAT),
+  # so we use --for all to ensure waypoint transit is enforced reliably.
+  istioctl --context "$ctx" waypoint apply -n "$ns" --for all --name waypoint >/dev/null || true
 
-  # Enroll services to use their per-service waypoint.
+  # Waypoint deployment runs with fixed UID (1337) and needs anyuid SCC on OpenShift.
+  oc --context "$ctx" adm policy add-scc-to-user anyuid -n "$ns" -z waypoint >/dev/null 2>&1 || true
+
+  # Enroll services to use the waypoint.
   for svc in productpage reviews ratings details; do
-    local wp="${svc}-waypoint"
-    kubectl --context "$ctx" -n "$ns" label svc "$svc" \
-      istio.io/use-waypoint="$wp" istio.io/use-waypoint-namespace="$ns" --overwrite >/dev/null
+    kubectl --context "$ctx" -n "$ns" label svc "$svc" istio.io/use-waypoint=waypoint --overwrite >/dev/null
   done
 
-  # Some interception/DNAT paths require labeling the destination workloads too.
-  for d in productpage-v1 reviews-v1 reviews-v2 reviews-v3 ratings-v1 details-v1; do
-    local wp
-    case "$d" in
-      productpage-v1) wp="productpage-waypoint" ;;
-      reviews-*) wp="reviews-waypoint" ;;
-      ratings-*) wp="ratings-waypoint" ;;
-      details-*) wp="details-waypoint" ;;
-      *) wp="" ;;
-    esac
-    [[ -n "$wp" ]] || continue
-    kubectl --context "$ctx" -n "$ns" patch "deploy/${d}" --type merge -p "{
-      \"spec\": {\"template\": {\"metadata\": {\"labels\": {
-        \"istio.io/use-waypoint\": \"${wp}\",
-        \"istio.io/use-waypoint-namespace\": \"${ns}\"
-      }}}}
-    }" >/dev/null 2>&1 || true
-  done
-
-  for sa in bookinfo-productpage bookinfo-reviews bookinfo-ratings bookinfo-details; do
-    kubectl --context "$ctx" -n "$ns" label sa "$sa" istio.io/use-waypoint- istio.io/use-waypoint-namespace- >/dev/null 2>&1 || true
-    # Keep SAs consistent with workloads.
-    case "$sa" in
-      bookinfo-productpage) wp="productpage-waypoint" ;;
-      bookinfo-reviews) wp="reviews-waypoint" ;;
-      bookinfo-ratings) wp="ratings-waypoint" ;;
-      bookinfo-details) wp="details-waypoint" ;;
-      *) wp="" ;;
-    esac
-    [[ -n "$wp" ]] || continue
-    kubectl --context "$ctx" -n "$ns" label sa "$sa" istio.io/use-waypoint="$wp" istio.io/use-waypoint-namespace="$ns" --overwrite >/dev/null 2>&1 || true
-  done
-
-  # Waypoint/gateway deployments run with fixed UID (1337) and need anyuid SCC on OpenShift.
-  for sa in bookinfo-gateway-istio productpage-waypoint reviews-waypoint ratings-waypoint details-waypoint; do
-    oc --context "$ctx" adm policy add-scc-to-user anyuid -n "$ns" -z "$sa" >/dev/null 2>&1 || true
-  done
+  # Multicluster ambient requirement: mark waypoint service as global.
+  kubectl --context "$ctx" -n "$ns" label svc waypoint istio.io/global=true --overwrite >/dev/null 2>&1 || true
 
   # Ensure waypoints are scraped for metrics (Kiali graph).
   apply_yaml "$ctx" "$ns" <<'EOF' >/dev/null
@@ -222,9 +188,7 @@ EOF
 
   enable_kiali_ambient_compat_rules "$ctx" "$ns"
 
-  for d in productpage-waypoint reviews-waypoint ratings-waypoint details-waypoint; do
-    kubectl --context "$ctx" -n "$ns" rollout status "deploy/${d}" --timeout=180s >/dev/null
-  done
+  kubectl --context "$ctx" -n "$ns" rollout status deploy/waypoint --timeout=180s >/dev/null
 
   log "Waypoints enabled on ${ctx}/${ns}."
 }
@@ -241,27 +205,12 @@ disable_bookinfo_waypoints() {
     kubectl --context "$ctx" -n "$ns" label svc "$svc" istio.io/use-waypoint- istio.io/use-waypoint-namespace- >/dev/null 2>&1 || true
   done
 
-  for d in productpage-v1 reviews-v1 reviews-v2 reviews-v3 ratings-v1 details-v1; do
-    kubectl --context "$ctx" -n "$ns" patch "deploy/${d}" --type json -p='[
-      {"op":"remove","path":"/spec/template/metadata/labels/istio.io~1use-waypoint"},
-      {"op":"remove","path":"/spec/template/metadata/labels/istio.io~1use-waypoint-namespace"}
-    ]' >/dev/null 2>&1 || true
-  done
+  kubectl --context "$ctx" -n "$ns" delete gateway.gateway.networking.k8s.io waypoint --ignore-not-found >/dev/null 2>&1 || true
+  oc --context "$ctx" -n "$ns" delete deploy waypoint --ignore-not-found >/dev/null 2>&1 || true
+  oc --context "$ctx" -n "$ns" delete svc waypoint --ignore-not-found >/dev/null 2>&1 || true
 
-  for sa in bookinfo-productpage bookinfo-reviews bookinfo-ratings bookinfo-details; do
-    kubectl --context "$ctx" -n "$ns" label sa "$sa" istio.io/use-waypoint- istio.io/use-waypoint-namespace- >/dev/null 2>&1 || true
-  done
-
-  for wp in productpage-waypoint reviews-waypoint ratings-waypoint details-waypoint; do
-    kubectl --context "$ctx" -n "$ns" delete gateway.gateway.networking.k8s.io "$wp" --ignore-not-found >/dev/null 2>&1 || true
-    oc --context "$ctx" -n "$ns" delete deploy "$wp" --ignore-not-found >/dev/null 2>&1 || true
-    oc --context "$ctx" -n "$ns" delete svc "$wp" --ignore-not-found >/dev/null 2>&1 || true
-  done
-
-  # Best-effort SCC cleanup.
-  for sa in bookinfo-gateway-istio productpage-waypoint reviews-waypoint ratings-waypoint details-waypoint; do
-    oc --context "$ctx" adm policy remove-scc-from-user anyuid -n "$ns" -z "$sa" >/dev/null 2>&1 || true
-  done
+  # Best-effort SCC cleanup (waypoint SA only).
+  oc --context "$ctx" adm policy remove-scc-from-user anyuid -n "$ns" -z waypoint >/dev/null 2>&1 || true
 
   log "Waypoints disabled on ${ctx}/${ns}."
 }

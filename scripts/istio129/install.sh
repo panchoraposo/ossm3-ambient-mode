@@ -9,6 +9,7 @@ need kubectl
 need oc
 need openssl
 need curl
+need python3
 
 require_context "$CTX_EAST"
 require_context "$CTX_WEST"
@@ -239,6 +240,81 @@ install_ambient_eastwest_gateway() {
   oc --context "$ctx" adm policy add-scc-to-user anyuid -n "$ISTIO_NS" -z istio-eastwestgateway-service-account >/dev/null 2>&1 || true
 
   kubectl --context "$ctx" -n "$ISTIO_NS" rollout status deploy/istio-eastwestgateway --timeout=300s >/dev/null
+
+  # Multicluster ambient: the network gateway service must be global.
+  kubectl --context "$ctx" -n "$ISTIO_NS" label svc istio-eastwestgateway istio.io/global=true --overwrite >/dev/null 2>&1 || true
+}
+
+wait_eastwest_lb_addr() {
+  local ctx="$1"
+  local addr=""
+  for _ in {1..90}; do
+    addr="$(kubectl --context "$ctx" -n "$ISTIO_NS" get svc istio-eastwestgateway -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+    [[ -n "$addr" ]] && { echo "$addr"; return 0; }
+    sleep 2
+  done
+  return 1
+}
+
+ensure_injector_network() {
+  local ctx="$1" network="$2"
+  log "Ensuring injector global.network=${network} on ${ctx}..."
+  local patch
+  patch="$(kubectl --context "$ctx" -n "$ISTIO_NS" get cm istio-sidecar-injector -o json 2>/dev/null | python3 -c '
+import sys,json
+cm=json.load(sys.stdin)
+j=json.loads(cm["data"]["values"])
+j.setdefault("global", {})["network"]=sys.argv[1]
+new=json.dumps(j, indent=2, sort_keys=True)
+print(json.dumps({"data":{"values":new}}))
+' "$network")"
+  kubectl --context "$ctx" -n "$ISTIO_NS" patch cm istio-sidecar-injector --type merge -p "$patch" >/dev/null 2>&1 || true
+  kubectl --context "$ctx" -n "$ISTIO_NS" rollout restart deploy/istiod >/dev/null 2>&1 || true
+  kubectl --context "$ctx" -n "$ISTIO_NS" rollout status deploy/istiod --timeout=300s >/dev/null 2>&1 || true
+}
+
+apply_mesh_networks() {
+  local east_addr="$1" west_addr="$2"
+  log "Configuring meshNetworks (required for cross-network failover)..."
+  local east_ip west_ip
+  east_ip="$(resolve_host_ip "$east_addr" || true)"
+  west_ip="$(resolve_host_ip "$west_addr" || true)"
+  [[ -n "$east_ip" ]] && east_addr="$east_ip"
+  [[ -n "$west_ip" ]] && west_addr="$west_ip"
+
+  local mn
+  mn="$(cat <<EOF
+networks:
+  network1:
+    endpoints:
+    - fromRegistry: ${CTX_EAST}
+    gateways:
+    - address: ${east_addr}
+      port: 15008
+  network2:
+    endpoints:
+    - fromRegistry: ${CTX_WEST}
+    gateways:
+    - address: ${west_addr}
+      port: 15008
+EOF
+)"
+
+  for ctx in "$CTX_EAST" "$CTX_WEST"; do
+    kubectl --context "$ctx" -n "$ISTIO_NS" patch cm istio --type merge \
+      -p "$(python3 - <<PY
+import json
+print(json.dumps({"data":{"meshNetworks":"""$mn"""}}))
+PY
+)" >/dev/null
+    # Ensure Istiod reloads the updated mesh networks config.
+    kubectl --context "$ctx" -n "$ISTIO_NS" rollout restart deploy/istiod >/dev/null 2>&1 || true
+    kubectl --context "$ctx" -n "$ISTIO_NS" rollout status deploy/istiod --timeout=300s >/dev/null 2>&1 || true
+    # Restart ztunnel so it reconnects with updated network config.
+    kubectl --context "$ctx" -n "$ISTIO_NS" rollout restart ds/ztunnel >/dev/null 2>&1 || true
+    kubectl --context "$ctx" -n "$ISTIO_NS" rollout status ds/ztunnel --timeout=300s >/dev/null 2>&1 || true
+  done
+  log "meshNetworks configured."
 }
 
 main() {
@@ -259,10 +335,21 @@ main() {
   install_istio_base "$CTX_EAST" "$CTX_EAST" "network1"
   install_istio_base "$CTX_WEST" "$CTX_WEST" "network2"
 
+  ensure_injector_network "$CTX_EAST" "network1"
+  ensure_injector_network "$CTX_WEST" "network2"
+
   create_remote_secrets
 
   install_ambient_eastwest_gateway "$CTX_EAST" "network1"
   install_ambient_eastwest_gateway "$CTX_WEST" "network2"
+
+  # meshNetworks must include both networks and the gateway address for each.
+  # Without this, cross-network routing (and failover) will not work: calls will fail when local endpoints go away.
+  local east_addr west_addr
+  east_addr="$(wait_eastwest_lb_addr "$CTX_EAST" || true)"
+  west_addr="$(wait_eastwest_lb_addr "$CTX_WEST" || true)"
+  [[ -n "$east_addr" && -n "$west_addr" ]] || die "east-west gateway LoadBalancer addresses not ready (east='${east_addr}', west='${west_addr}')"
+  apply_mesh_networks "$east_addr" "$west_addr"
 
   log ""
   log "East-west gateway services:"
